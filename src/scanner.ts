@@ -40,10 +40,42 @@ async function readSubnetNames(rpc: SubtensorRpc, hash: string): Promise<Map<num
   return names;
 }
 
+function rpcBigInt(value: unknown): bigint | null {
+  if (typeof value === 'bigint') return value >= 0n ? value : null;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === 'string' && /^\d+$/.test(value)) return BigInt(value);
+  return null;
+}
+
 /**
- * Read one finalized block plus the exact pre-coinbase state used by the runtime formula.
+ * Price lookup is deliberately non-fatal. Actual injection / Chain Buy archival
+ * must continue even if an endpoint temporarily disables one price RPC.
+ */
+async function readAlphaPrices(rpc: SubtensorRpc, atHash: string): Promise<Map<number,bigint>> {
+  try {
+    const records = await rpc.currentAlphaPricesAll(atHash);
+    const prices = new Map<number,bigint>();
+    for (const record of records ?? []) {
+      const netuid = Number(record?.netuid);
+      const price = rpcBigInt(record?.price);
+      if (Number.isInteger(netuid) && netuid > 0 && price != null) prices.set(netuid, price);
+    }
+    if (prices.size > 0) return prices;
+  } catch {
+    // Fall through to the raw runtime API below.
+  }
+
+  try {
+    return decodeSubnetPrices(await rpc.currentAlphaPricesAllScale(atHash));
+  } catch {
+    return new Map();
+  }
+}
+
+/**
+ * Read one finalized block plus the pre-coinbase state used by the runtime formula.
  * RootProp is updated after coinbase, so block N theory uses RootProp at block N-1.
- * The alpha spot price is likewise queried through SwapRuntimeApi at block N-1.
+ * The alpha spot price is also read at block N-1.
  */
 async function readBlockState(
   rpc: SubtensorRpc,
@@ -63,12 +95,12 @@ async function readBlockState(
   }
   const parentRootKeys = candidates.map(storageKeys.rootProp);
 
-  const [state, parentRootState, encodedPrices] = await Promise.all([
+  // Price lookup catches its own failures, so theory can never block actual chain collection.
+  const [state, parentRootState, prices] = await Promise.all([
     rpc.queryStorage(currentKeys, hash),
     rpc.queryStorage(parentRootKeys, parentHash),
-    rpc.currentAlphaPricesAll(parentHash)
+    readAlphaPrices(rpc, parentHash)
   ]);
-  const prices = decodeSubnetPrices(encodedPrices);
 
   const timestampMs = Number(decodeU64(state.get(TIMESTAMP_NOW_KEY) ?? null));
   if (!Number.isSafeInteger(timestampMs) || timestampMs <= 0) throw new Error(`Invalid Timestamp.Now at block ${blockNumber}`);
@@ -84,18 +116,21 @@ async function readBlockState(
     const chainBuy = decodeU64(state.get(storageKeys.excessTao(netuid)) ?? null);
     const alphaEmission = decodeU64(state.get(storageKeys.alphaOutEmission(netuid)) ?? null);
     const rootProportionRaw = decodeU96F32Raw(parentRootState.get(storageKeys.rootProp(netuid)) ?? null);
-    const priceRaoPerAlpha = prices.get(netuid) ?? 0n;
+    const priceRaoPerAlpha = prices.get(netuid);
 
-    const theory = calculateTheoreticalInjectedRao({
-      blockNumber,
-      netuid,
-      actualRao: actual,
-      chainBuyRao: chainBuy,
-      rootProportionRaw,
-      alphaEmissionRao: alphaEmission,
-      priceRaoPerAlpha
-    });
-    payload[String(netuid)] = [actual.toString(), chainBuy.toString(), theory.toString()];
+    const theory = priceRaoPerAlpha == null
+      ? null
+      : calculateTheoreticalInjectedRao({
+          blockNumber,
+          netuid,
+          actualRao: actual,
+          chainBuyRao: chainBuy,
+          rootProportionRaw,
+          alphaEmissionRao: alphaEmission,
+          priceRaoPerAlpha
+        });
+
+    payload[String(netuid)] = [actual.toString(), chainBuy.toString(), theory?.toString() ?? null];
   }
   return { timestampMs, payload, active };
 }
@@ -182,6 +217,7 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
     const registry = await syncRegistry(env, rpc, finalizedHash, finalizedBlock, candidates, lastActive);
     await setState(env.META_DB, 'rpc_status', 'ok');
     await setState(env.META_DB, 'chain_finalized_block', String(finalizedBlock));
+    await env.META_DB.prepare("DELETE FROM sync_state WHERE key='last_error'").run();
     return {
       finalizedBlock,
       scanned: Math.max(0, finalizedBlock - start + 1),
