@@ -56,6 +56,13 @@ export async function storeBlock(env: Env, blockNumber: number, blockHash: strin
   return changes > 0;
 }
 
+/** Replace only the compact payload after a best-effort theory calculation. */
+export async function updateBlockPayload(env: Env, blockNumber: number, timestampMs: number, payload: BlockPayload): Promise<void> {
+  const db = blockDbForTimestamp(env, timestampMs);
+  await db.prepare('UPDATE blocks SET payload = ? WHERE block_number = ?')
+    .bind(JSON.stringify(payload), blockNumber).run();
+}
+
 function emptySummary(value: [string,string,string|null]): SubnetSummaryValue {
   return ['0','0',value[2] == null ? null : '0',0];
 }
