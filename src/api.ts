@@ -1,5 +1,5 @@
 import type { Env, SummaryPayload } from './types';
-import { addBlockToSummary, blockDatabases, DAY_MS, HOUR_MS, mergeSummaries, MINUTE_MS } from './db';
+import { addBlockToSummary, blockDatabases, DAY_MS, HOUR_MS, mergeSummaries } from './db';
 import { getState } from './db';
 import { scanToFinalized } from './scanner';
 
@@ -50,9 +50,9 @@ async function subnets(env: Env): Promise<Response> {
   return json({ items: result.results });
 }
 
-async function mergeSummaryRows(env: Env, table:'minute_summary'|'hourly_summary'|'daily_summary', startInclusive:number, endExclusive:number, target:SummaryPayload):Promise<void>{
+async function mergeHourlyRows(env: Env, startInclusive:number, endExclusive:number, target:SummaryPayload):Promise<void>{
   if(endExclusive<=startInclusive) return;
-  const result=await env.META_DB.prepare(`SELECT payload FROM ${table} WHERE period_start_ms>=? AND period_start_ms<? ORDER BY period_start_ms`)
+  const result=await env.META_DB.prepare(`SELECT payload FROM hourly_summary WHERE period_start_ms>=? AND period_start_ms<? ORDER BY period_start_ms`)
     .bind(startInclusive,endExclusive).all<{payload:string}>();
   for(const row of result.results) mergeSummaries(target,JSON.parse(row.payload) as SummaryPayload);
 }
@@ -66,35 +66,16 @@ async function mergeRawBlocks(env:Env,startInclusive:number,endExclusive:number,
   }
 }
 
-/** Exact range aggregation using daily/hourly/minute summaries plus raw sub-minute edges. */
+/** Exact range aggregation: closed full hours from deterministic cache; edge hours from raw blocks. */
 async function aggregateRange(env:Env,from:number,to:number):Promise<SummaryPayload>{
   const target:SummaryPayload={};
-  let cursor=from;
   const end=to+1;
-  if(end<=cursor) return target;
-
-  let boundary=Math.min(end,ceilTo(cursor,MINUTE_MS));
-  if(boundary>cursor){ await mergeRawBlocks(env,cursor,boundary,target); cursor=boundary; }
-  if(cursor>=end) return target;
-
-  boundary=Math.min(end,ceilTo(cursor,HOUR_MS));
-  if(boundary>cursor){ await mergeSummaryRows(env,'minute_summary',cursor,boundary,target); cursor=boundary; }
-  if(cursor>=end) return target;
-
-  boundary=Math.min(end,ceilTo(cursor,DAY_MS));
-  if(boundary>cursor){ await mergeSummaryRows(env,'hourly_summary',cursor,boundary,target); cursor=boundary; }
-  if(cursor>=end) return target;
-
-  boundary=floorTo(end,DAY_MS);
-  if(boundary>cursor){ await mergeSummaryRows(env,'daily_summary',cursor,boundary,target); cursor=boundary; }
-
-  boundary=floorTo(end,HOUR_MS);
-  if(boundary>cursor){ await mergeSummaryRows(env,'hourly_summary',cursor,boundary,target); cursor=boundary; }
-
-  boundary=floorTo(end,MINUTE_MS);
-  if(boundary>cursor){ await mergeSummaryRows(env,'minute_summary',cursor,boundary,target); cursor=boundary; }
-
-  if(cursor<end) await mergeRawBlocks(env,cursor,end,target);
+  if(end<=from) return target;
+  const fullStart=Math.min(end,ceilTo(from,HOUR_MS));
+  const fullEnd=Math.max(fullStart,floorTo(end,HOUR_MS));
+  await mergeRawBlocks(env,from,fullStart,target);
+  await mergeHourlyRows(env,fullStart,fullEnd,target);
+  await mergeRawBlocks(env,fullEnd,end,target);
   return target;
 }
 
@@ -188,9 +169,6 @@ async function chart(req: Request, env: Env): Promise<Response> {
   if (!Number.isInteger(netuid)) return bad('invalid netuid');
   const now=Date.now();
   const from=parseTime(url.searchParams.get('from'),now-DAY_MS), to=parseTime(url.searchParams.get('to'),now);
-  const span=to-from;
-  const table=span>2*DAY_MS?'hourly_summary':'minute_summary';
-  const intervalMs=table==='hourly_summary'?HOUR_MS:MINUTE_MS;
   const key=`$."${netuid}"`;
   const result=await env.META_DB.prepare(`
     SELECT period_start_ms,
@@ -198,11 +176,11 @@ async function chart(req: Request, env: Env): Promise<Response> {
       CAST(json_extract(payload, ? || '[1]') AS INTEGER) AS chain_buy_rao,
       CASE WHEN json_extract(payload, ? || '[2]') IS NULL THEN NULL ELSE CAST(json_extract(payload, ? || '[2]') AS INTEGER) END AS theory_rao,
       CAST(json_extract(payload, ? || '[3]') AS INTEGER) AS subnet_block_count
-    FROM ${table}
+    FROM hourly_summary
     WHERE period_start_ms BETWEEN ? AND ? AND json_extract(payload, ?) IS NOT NULL
     ORDER BY period_start_ms ASC
   `).bind(key,key,key,key,key,from,to,key).all();
-  return json({from,to,intervalMs,items:result.results});
+  return json({from,to,intervalMs:HOUR_MS,items:result.results});
 }
 
 async function exportCsv(req: Request, env: Env): Promise<Response> {
