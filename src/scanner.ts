@@ -98,7 +98,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-/** Core collection path: only finalized on-chain values required for the monitor. */
 async function readBlockState(
   rpc: SubtensorRpc,
   hash: string,
@@ -126,11 +125,6 @@ async function readBlockState(
   return { timestampMs, payload, active };
 }
 
-/**
- * Best-effort theory enrichment.
- * N-1 is only one block behind the finalized block, so use the same verified Finney RPC
- * instead of a separate archive endpoint. Theory failures never block real chain data.
- */
 async function tryEnrichTheoryForBlock(
   env: Env,
   rpc: SubtensorRpc,
@@ -195,15 +189,20 @@ async function tryEnrichTheoryForBlock(
     await setState(env.META_DB, 'theory_last_missing_price', String(missingPrice));
     if (changed > 0) {
       await env.META_DB.prepare("DELETE FROM sync_state WHERE key='theory_last_error'").run();
+      await env.META_DB.prepare("DELETE FROM sync_state WHERE key='last_error'").run();
     } else {
-      await setState(env.META_DB, 'theory_last_error', `No theory rows produced: active=${active.length}, missingAlpha=${missingAlpha}, missingRoot=${missingRoot}, missingPrice=${missingPrice}`);
+      const detail = `Theory produced no rows: active=${active.length}, missingAlpha=${missingAlpha}, missingRoot=${missingRoot}, missingPrice=${missingPrice}`;
+      await setState(env.META_DB, 'theory_last_error', detail);
+      await setState(env.META_DB, 'last_error', detail);
     }
     return changed;
   } catch (error) {
+    const detail = `Theory: ${error instanceof Error ? error.message : String(error)}`;
     await setState(env.META_DB, 'theory_status', 'error');
     await setState(env.META_DB, 'theory_last_block', String(blockNumber));
     await setState(env.META_DB, 'theory_last_enriched', '0');
-    await setState(env.META_DB, 'theory_last_error', error instanceof Error ? error.message : String(error));
+    await setState(env.META_DB, 'theory_last_error', detail);
+    await setState(env.META_DB, 'last_error', detail);
     return 0;
   }
 }
@@ -268,7 +267,6 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
 
     let start: number;
     if (saved > 0 && theoryLast === 0) {
-      // One-time backfill after enabling theory: revisit the most recent batch already stored.
       start = Math.max(1, Math.min(saved, finalizedBlock) - Math.max(1, maxBlocks) + 1);
     } else {
       start = saved > 0 ? saved + 1 : finalizedBlock;
@@ -306,7 +304,6 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
 
     await setState(env.META_DB, 'rpc_status', 'ok');
     await setState(env.META_DB, 'chain_finalized_block', String(finalizedBlock));
-    await env.META_DB.prepare("DELETE FROM sync_state WHERE key='last_error'").run();
     return {
       finalizedBlock,
       scanned: Math.max(0, finalizedBlock - start + 1),
