@@ -1,0 +1,31 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "inject",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-20",
+  "workers_dev": true,
+  "preview_urls": true,
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "triggers": {
+    "crons": ["* * * * *", "17 0 * * *"]
+  },
+  "vars": {
+    "SUBTENSOR_WS_URL": "wss://entrypoint-finney.opentensor.ai:443",
+    "RETENTION_DAYS": "30"
+  }
+
+  // 免费版 D1 单库上限 500 MB。为了稳定保留 30 天，正式部署使用：
+  // 1 个元数据库 + 4 个 8 天滚动区块分片数据库。
+  // 创建数据库后，将以下配置取消注释并填入对应 database_id。
+  // ,"d1_databases": [
+  //   {"binding":"META_DB","database_name":"inject-meta","database_id":"<id>","migrations_dir":"migrations/meta"},
+  //   {"binding":"BLOCKS_0","database_name":"inject-blocks-0","database_id":"<id>","migrations_dir":"migrations/blocks"},
+  //   {"binding":"BLOCKS_1","database_name":"inject-blocks-1","database_id":"<id>","migrations_dir":"migrations/blocks"},
+  //   {"binding":"BLOCKS_2","database_name":"inject-blocks-2","database_id":"<id>","migrations_dir":"migrations/blocks"},
+  //   {"binding":"BLOCKS_3","database_name":"inject-blocks-3","database_id":"<id>","migrations_dir":"migrations/blocks"}
+  // ]
+}
