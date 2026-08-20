@@ -20,6 +20,7 @@ import {
   calculateIndependentTheory,
   DEFAULT_GATE_EXPONENT_RAW,
   DEFAULT_GATE_QUANTILE_RAW,
+  DEFAULT_GATE_RANK,
   type TheorySnapshot,
   type TheorySubnetState
 } from './theory';
@@ -109,6 +110,7 @@ function formulaStorageKeys(candidates: number[]): string[] {
     globalStorageKeys.emissionGateBar,
     globalStorageKeys.emissionGateExponent,
     globalStorageKeys.emissionBarQuantile,
+    globalStorageKeys.emissionBarRank,
     storageKeys.subnetTao(ROOT_NETUID)
   ]);
   for (const netuid of candidates) {
@@ -157,6 +159,7 @@ function decodeFormulaSnapshot(
 
   const gateExponentHex = state.get(globalStorageKeys.emissionGateExponent) ?? null;
   const gateQuantileHex = state.get(globalStorageKeys.emissionBarQuantile) ?? null;
+  const gateRankHex = state.get(globalStorageKeys.emissionBarRank) ?? null;
   return {
     totalIssuanceRao: decodeU64(totalIssuanceHex),
     rootTaoRao: decodeU64(state.get(storageKeys.subnetTao(ROOT_NETUID)) ?? null),
@@ -164,6 +167,7 @@ function decodeFormulaSnapshot(
     emissionGateBarRaw: decodeU64F64Raw(state.get(globalStorageKeys.emissionGateBar) ?? null),
     emissionGateExponentRaw: gateExponentHex == null ? DEFAULT_GATE_EXPONENT_RAW : decodeU64F64Raw(gateExponentHex),
     emissionBarQuantileRaw: gateQuantileHex == null ? DEFAULT_GATE_QUANTILE_RAW : decodeU64F64Raw(gateQuantileHex),
+    emissionBarRank: gateRankHex == null ? DEFAULT_GATE_RANK : decodeU16(gateRankHex),
     subnets
   };
 }
