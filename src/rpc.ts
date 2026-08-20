@@ -19,34 +19,26 @@ export class SubtensorRpc {
 
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error('Subtensor WebSocket connection timeout')), 12_000);
-      const onOpen = () => {
-        clearTimeout(timer);
-        cleanup();
-        resolve();
-      };
-      const onError = () => {
-        clearTimeout(timer);
-        cleanup();
-        reject(new Error(`Unable to connect to Subtensor WebSocket: ${this.url}`));
-      };
-      const cleanup = () => {
-        ws.removeEventListener('open', onOpen);
-        ws.removeEventListener('error', onError);
-      };
+      const onOpen = () => { clearTimeout(timer); cleanup(); resolve(); };
+      const onError = () => { clearTimeout(timer); cleanup(); reject(new Error(`Unable to connect to Subtensor WebSocket: ${this.url}`)); };
+      const cleanup = () => { ws.removeEventListener('open', onOpen); ws.removeEventListener('error', onError); };
       ws.addEventListener('open', onOpen);
       ws.addEventListener('error', onError);
     });
 
     ws.addEventListener('message', (event: MessageEvent) => {
       try {
-        const msg = JSON.parse(String(event.data)) as JsonRpcResponse<unknown>;
-        if (typeof msg.id !== 'number') return;
-        const waiter = this.pending.get(msg.id);
-        if (!waiter) return;
-        clearTimeout(waiter.timer);
-        this.pending.delete(msg.id);
-        if (msg.error) waiter.reject(new Error(`RPC ${msg.error.code}: ${msg.error.message}`));
-        else waiter.resolve(msg.result);
+        const parsed = JSON.parse(String(event.data)) as JsonRpcResponse<unknown> | JsonRpcResponse<unknown>[];
+        const messages = Array.isArray(parsed) ? parsed : [parsed];
+        for (const msg of messages) {
+          if (typeof msg?.id !== 'number') continue;
+          const waiter = this.pending.get(msg.id);
+          if (!waiter) continue;
+          clearTimeout(waiter.timer);
+          this.pending.delete(msg.id);
+          if (msg.error) waiter.reject(new Error(`RPC ${msg.error.code}: ${msg.error.message}`));
+          else waiter.resolve(msg.result);
+        }
       } catch {
         // Ignore non-JSON notifications. We do not subscribe in this client.
       }
@@ -63,39 +55,55 @@ export class SubtensorRpc {
     ws.addEventListener('error', rejectAll);
   }
 
+  private prepare<T>(method: string): { id: number; promise: Promise<T> } {
+    const id = ++this.id;
+    const promise = new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`RPC timeout: ${method}`));
+      }, 20_000);
+      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
+    });
+    return { id, promise };
+  }
+
   async call<T>(method: string, params: unknown[] = []): Promise<T> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) await this.connect();
     const ws = this.ws;
     if (!ws) throw new Error('WebSocket not initialized');
-    const id = ++this.id;
-    const result = new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`RPC timeout: ${method}`));
-      }, 15_000);
-      this.pending.set(id, { resolve: resolve as (value: unknown) => void, reject, timer });
-    });
-    ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
-    return result;
+    const prepared = this.prepare<T>(method);
+    ws.send(JSON.stringify({ jsonrpc: '2.0', id: prepared.id, method, params }));
+    return prepared.promise;
   }
 
-  finalizedHead(): Promise<string> {
-    return this.call<string>('chain_getFinalizedHead');
+  async batch<T>(calls: Array<{ method: string; params?: unknown[] }>): Promise<T[]> {
+    if (!calls.length) return [];
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) await this.connect();
+    const ws = this.ws;
+    if (!ws) throw new Error('WebSocket not initialized');
+    const prepared = calls.map(call => ({ call, waiter: this.prepare<T>(call.method) }));
+    ws.send(JSON.stringify(prepared.map(x => ({ jsonrpc: '2.0', id: x.waiter.id, method: x.call.method, params: x.call.params ?? [] }))));
+    return Promise.all(prepared.map(x => x.waiter.promise));
   }
 
-  async header(hash: string): Promise<{ number: string; parentHash: string }> {
-    return this.call('chain_getHeader', [hash]);
-  }
+  finalizedHead(): Promise<string> { return this.call<string>('chain_getFinalizedHead'); }
+  async header(hash: string): Promise<{ number: string; parentHash: string }> { return this.call('chain_getHeader', [hash]); }
+  blockHash(blockNumber: number): Promise<string | null> { return this.call<string | null>('chain_getBlockHash', [blockNumber]); }
 
-  blockHash(blockNumber: number): Promise<string | null> {
-    return this.call<string | null>('chain_getBlockHash', [blockNumber]);
-  }
-
+  /**
+   * Read the full storage state for every requested key at one block.
+   * Do not use state_queryStorageAt here: the monitor needs complete values,
+   * not a change-set style response, otherwise inactive/unchanged keys can be
+   * misclassified and per-block emission becomes incomplete.
+   */
   async queryStorage(keys: string[], atHash: string): Promise<Map<string, string | null>> {
-    if (!keys.length) return new Map();
-    const sets = await this.call<Array<{ block: string; changes: Array<[string, string | null]> }>>('state_queryStorageAt', [keys, atHash]);
     const map = new Map<string, string | null>();
-    for (const set of sets ?? []) for (const [key, value] of set.changes ?? []) map.set(key, value);
+    const chunkSize = 96;
+    for (let i = 0; i < keys.length; i += chunkSize) {
+      const chunk = keys.slice(i, i + chunkSize);
+      const values = await this.batch<string | null>(chunk.map(key => ({ method: 'state_getStorage', params: [key, atHash] })));
+      chunk.forEach((key, index) => map.set(key, values[index] ?? null));
+    }
     return map;
   }
 
