@@ -1,5 +1,7 @@
 import type { Env } from './types';
 
+const DATA_VERSION = '2';
+
 const META_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS subnets (
     netuid INTEGER PRIMARY KEY,
@@ -41,6 +43,28 @@ async function run(db: D1Database, statements: string[]): Promise<void> {
   await db.batch(statements.map(sql => db.prepare(sql)));
 }
 
+async function ensureDataVersion(env: Env): Promise<void> {
+  const row = await env.META_DB.prepare("SELECT value FROM sync_state WHERE key='data_version'").first<{value:string}>();
+  if (row?.value === DATA_VERSION) return;
+
+  // v1 used change-set RPC reads and therefore stored incomplete per-block state.
+  // The project has only just launched, so discard those invalid records once
+  // and restart cleanly from the first finalized block after this deployment.
+  await Promise.all([
+    env.BLOCKS_0.prepare('DELETE FROM blocks').run(),
+    env.BLOCKS_1.prepare('DELETE FROM blocks').run(),
+    env.BLOCKS_2.prepare('DELETE FROM blocks').run(),
+    env.BLOCKS_3.prepare('DELETE FROM blocks').run()
+  ]);
+  await env.META_DB.batch([
+    env.META_DB.prepare('DELETE FROM subnets'),
+    env.META_DB.prepare('DELETE FROM hourly_summary'),
+    env.META_DB.prepare('DELETE FROM sync_state')
+  ]);
+  await env.META_DB.prepare('INSERT INTO sync_state(key,value,updated_at_ms) VALUES(?,?,?)')
+    .bind('data_version', DATA_VERSION, Date.now()).run();
+}
+
 export function ensureSchema(env: Env): Promise<void> {
   if (!ready) {
     ready = (async () => {
@@ -51,6 +75,7 @@ export function ensureSchema(env: Env): Promise<void> {
         run(env.BLOCKS_2, BLOCK_SCHEMA),
         run(env.BLOCKS_3, BLOCK_SCHEMA)
       ]);
+      await ensureDataVersion(env);
     })().catch(error => {
       ready = null;
       throw error;
