@@ -5,6 +5,11 @@ interface JsonRpcResponse<T> {
   error?: { code: number; message: string; data?: unknown };
 }
 
+export interface RpcSubnetPrice {
+  netuid: number;
+  price: number | string;
+}
+
 export class SubtensorRpc {
   private ws: WebSocket | null = null;
   private id = 0;
@@ -90,14 +95,14 @@ export class SubtensorRpc {
   async header(hash: string): Promise<{ number: string; parentHash: string }> { return this.call('chain_getHeader', [hash]); }
   blockHash(blockNumber: number): Promise<string | null> { return this.call<string | null>('chain_getBlockHash', [blockNumber]); }
 
-  /** Call a runtime API against an exact historical state. */
-  stateCall(runtimeMethod: string, data: string, atHash: string): Promise<string> {
-    return this.call<string>('state_call', [runtimeMethod, data, atHash]);
+  /** Bittensor v443 exposes this decoded RPC directly, including an optional historical hash. */
+  currentAlphaPricesAll(atHash: string): Promise<RpcSubnetPrice[]> {
+    return this.call<RpcSubnetPrice[]>('swap_currentAlphaPriceAll', [atHash]);
   }
 
-  /** SCALE Vec<SubnetPrice>; each price is TAO/alpha scaled by 1e9 in the runtime API. */
-  currentAlphaPricesAll(atHash: string): Promise<string> {
-    return this.stateCall('SwapRuntimeApi_current_alpha_price_all', '0x', atHash);
+  /** Raw runtime API fallback for endpoints that do not expose the decoded swap RPC. */
+  currentAlphaPricesAllScale(atHash: string): Promise<string> {
+    return this.call<string>('state_call', ['SwapRuntimeApi_current_alpha_price_all', '0x', atHash]);
   }
 
   /**
