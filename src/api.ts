@@ -26,9 +26,11 @@ function floorTo(value:number, unit:number):number { return Math.floor(value/uni
 
 async function status(env: Env): Promise<Response> {
   const db=env.META_DB;
-  const [last, chain, syncMs, rpcStatus, error, added, removed] = await Promise.all([
+  const [last, chain, syncMs, rpcStatus, error, added, removed, theoryStatus, theoryBlock, theoryEnriched, missingRoot, missingAlpha, missingPrice] = await Promise.all([
     getState(db,'last_finalized_block'), getState(db,'chain_finalized_block'), getState(db,'last_sync_ms'),
-    getState(db,'rpc_status'), getState(db,'last_error'), getState(db,'registry_added_last'), getState(db,'registry_removed_last')
+    getState(db,'rpc_status'), getState(db,'last_error'), getState(db,'registry_added_last'), getState(db,'registry_removed_last'),
+    getState(db,'theory_status'), getState(db,'theory_last_block'), getState(db,'theory_last_enriched'),
+    getState(db,'theory_last_missing_root'), getState(db,'theory_last_missing_alpha'), getState(db,'theory_last_missing_price')
   ]);
   const active = await db.prepare("SELECT COUNT(*) AS n FROM subnets WHERE status='active' AND netuid > 0").first<{n:number}>();
   return json({
@@ -41,6 +43,12 @@ async function status(env: Env): Promise<Response> {
     removedLastSync: Number(removed ?? 0),
     lastError: error ?? null,
     theoryEnabled: true,
+    theoryStatus: theoryStatus ?? 'waiting',
+    theoryLastBlock: Number(theoryBlock ?? 0),
+    theoryLastEnriched: Number(theoryEnriched ?? 0),
+    theoryMissingRoot: Number(missingRoot ?? 0),
+    theoryMissingAlpha: Number(missingAlpha ?? 0),
+    theoryMissingPrice: Number(missingPrice ?? 0),
     retentionDays: Number(env.RETENTION_DAYS ?? '30')
   });
 }
