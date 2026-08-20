@@ -30,27 +30,27 @@ Bittensor Subtensor WebSocket RPC
               ▼
        Cloudflare Worker
        ├─ Cron 每分钟追块
-       ├─ 缺块自动补采
+       ├─ 区块游标 / 失败重试
        ├─ 子网动态发现
-       ├─ 汇总/查询 API
+       ├─ 精确区间汇总 API
        └─ 30 天自动清理
               │
       ┌───────┴────────┐
       ▼                ▼
   inject-meta       4 个区块分片 D1
   子网目录/状态      每片 8 天滚动窗口
-  分钟/小时/日汇总   合计覆盖 32 天
+  闭合小时精确汇总   合计覆盖 32 天
               │
               ▼
        Static Assets 前端
        *.workers.dev
 ```
 
-Cloudflare Free 的 D1 单库上限为 500 MB，因此使用 **1 个元数据库 + 4 个区块分片数据库**，避免 30 天原始区块数据把单库撑满。
+Cloudflare Free 的 D1 单库上限为 500 MB，因此使用 **1 个元数据库 + 4 个区块分片数据库**。完整小时使用可重复重建的精确小时汇总；任意自定义时间的首尾零散区间直接读取原始区块，因此汇总与明细保持一致。
 
 ## 当前代码状态
 
-已实现第一阶段工程：
+已实现：
 
 - Cloudflare Worker + Static Assets
 - Subtensor WebSocket JSON-RPC 客户端
@@ -59,27 +59,28 @@ Cloudflare Free 的 D1 单库上限为 500 MB，因此使用 **1 个元数据库
 - `SubnetIdentitiesV3` 名称读取
 - `RegisteredSubnetCounter` 跟踪
 - 实际 Injected / Chain Buys 采集
-- 1+4 D1 滚动分片
-- 分钟 / 小时 / 日准确汇总
+- 1 + 4 D1 滚动分片
+- 可重复重建的精确小时汇总
+- 任意时间范围的精确汇总：完整小时走汇总，边缘时间走原始区块
 - 30 天清理
 - API：status / subnets / summary / blocks / chart / CSV / sync
-- 已确认 V17 页面改造成真实 API 前端
+- V17 页面已接真实 API
+- 首次运行自动初始化 D1 表结构
 
-> `src/theory.ts` 是理论计算的唯一入口。该模块目前不会伪造数值；精确公式启用后，所有汇总、明细和偏差会自动使用同一套逐区块理论结果。
+> `src/theory.ts` 是理论计算的唯一入口。当前不会伪造理论值；精确公式启用前，页面理论值与偏差显示 `—`。
 
-## Cloudflare 一次性配置
+## Cloudflare 部署
 
-需要创建以下 5 个免费 D1 数据库：
+`wrangler.jsonc` 已声明 5 个 D1 绑定但不写死数据库 ID，优先使用 Cloudflare 的自动资源配置能力。首次 GitHub 部署时若自动配置成功，会自动创建并绑定所需 D1；Worker 第一次调用 API 或 Cron 时会自动创建数据表。
 
-- `inject-meta`
-- `inject-blocks-0`
-- `inject-blocks-1`
-- `inject-blocks-2`
-- `inject-blocks-3`
+部署入口：Cloudflare → Workers & Pages → Create application → Import a repository → 选择 `cathy1688/Inject`
 
-然后将 5 个 `database_id` 写入 `wrangler.jsonc`，再应用：
+建议：
 
-- `migrations/meta/0001_init.sql` → `inject-meta`
-- `migrations/blocks/0001_init.sql` → 四个区块分片
+- Worker / Project name：`inject`
+- Production branch：`main`
+- Root directory：`/`
+- Deploy command：`npx wrangler deploy`
+- 使用自动分配的 `*.workers.dev` 地址
 
-完成后，Cloudflare 连接 GitHub `cathy1688/Inject`，部署到自动分配的 `*.workers.dev` 地址。
+如果 Cloudflare 控制台未自动创建 D1，按 `docs/DEPLOY.md` 的备用步骤手动创建并绑定即可。
