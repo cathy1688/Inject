@@ -5,14 +5,24 @@ import {
   TIMESTAMP_NOW_KEY,
   decodeBool,
   decodeFirstVecUtf8,
+  decodeI96F32Raw,
   decodeSubnetPrices,
+  decodeU16,
   decodeU64,
+  decodeU64F64Raw,
   decodeU96F32Raw,
+  globalStorageKeys,
   netuidFromBlake2ConcatStorageKey,
   netuidFromIdentityStorageKey,
   storageKeys
 } from './storage';
-import { calculateTheoreticalInjectedRao } from './theory';
+import {
+  calculateIndependentTheory,
+  DEFAULT_GATE_EXPONENT_RAW,
+  DEFAULT_GATE_QUANTILE_RAW,
+  type TheorySnapshot,
+  type TheorySubnetState
+} from './theory';
 import {
   ensureClosedHourlySummaries,
   getEarliestStoredBlockNumber,
@@ -29,20 +39,14 @@ import {
 
 const DEFAULT_WS = 'wss://entrypoint-finney.opentensor.ai:443';
 const ROOT_NETUID = 0;
-const THEORY_FORMULA_VERSION = '5';
-const THEORY_BACKFILL_BATCH = 12;
-
-type FormulaSnapshot = {
-  rootByNetuid: Map<number, bigint>;
-  priceByNetuid: Map<number, bigint>;
-};
+const THEORY_FORMULA_VERSION = '6-independent';
+const THEORY_BACKFILL_BATCH = 4;
 
 type BlockState = {
   timestampMs: number;
   payload: BlockPayload;
   active: number[];
-  alphaEmissionByNetuid: Map<number, bigint>;
-  currentRootByNetuid: Map<number, bigint>;
+  nextFormula: TheorySnapshot;
 };
 
 type TheoryStats = { enriched: number; missingRoot: number; missingAlpha: number; missingPrice: number };
@@ -98,79 +102,128 @@ async function readAlphaPrices(rpc: SubtensorRpc, atHash: string): Promise<Map<n
   catch { return new Map(); }
 }
 
-async function readFormulaSnapshot(rpc: SubtensorRpc, hash: string, candidates: number[]): Promise<FormulaSnapshot> {
-  const rootKeys = candidates.map(storageKeys.rootProp);
-  const [rootState, prices] = await Promise.all([rpc.queryStorage(rootKeys, hash), readAlphaPrices(rpc, hash)]);
-  const rootByNetuid = new Map<number,bigint>();
+function formulaStorageKeys(candidates: number[]): string[] {
+  const keys = new Set<string>([
+    globalStorageKeys.totalIssuance,
+    globalStorageKeys.taoWeight,
+    globalStorageKeys.emissionGateBar,
+    globalStorageKeys.emissionGateExponent,
+    globalStorageKeys.emissionBarQuantile,
+    storageKeys.subnetTao(ROOT_NETUID)
+  ]);
   for (const netuid of candidates) {
-    // Zero is a valid RootProp. Presence of the netuid in the map means the value was read.
-    rootByNetuid.set(netuid, decodeU96F32Raw(rootState.get(storageKeys.rootProp(netuid)) ?? null));
+    keys.add(storageKeys.networksAdded(netuid));
+    keys.add(storageKeys.firstEmissionBlockNumber(netuid));
+    keys.add(storageKeys.subtokenEnabled(netuid));
+    keys.add(storageKeys.networkRegistrationAllowed(netuid));
+    keys.add(storageKeys.subnetEmissionEnabled(netuid));
+    keys.add(storageKeys.subnetMechanism(netuid));
+    keys.add(storageKeys.subnetMovingPrice(netuid));
+    keys.add(storageKeys.minerBurned(netuid));
+    keys.add(storageKeys.subnetAlphaIn(netuid));
+    keys.add(storageKeys.subnetAlphaOut(netuid));
   }
-  return { rootByNetuid, priceByNetuid: prices };
+  return [...keys];
 }
 
+function boolWithDefault(raw: string | null | undefined, fallback: boolean): boolean {
+  return raw == null ? fallback : decodeBool(raw);
+}
+
+function decodeFormulaSnapshot(
+  state: Map<string, string | null>,
+  candidates: number[],
+  prices: Map<number,bigint>
+): TheorySnapshot {
+  const totalIssuanceHex = state.get(globalStorageKeys.totalIssuance) ?? null;
+  const taoWeightHex = state.get(globalStorageKeys.taoWeight) ?? null;
+  if (totalIssuanceHex == null) throw new Error('Missing Subtensor.TotalIssuance for theory');
+  if (taoWeightHex == null) throw new Error('Missing Subtensor.TaoWeight for theory');
+
+  const subnets: TheorySubnetState[] = candidates.map(netuid => ({
+    netuid,
+    networkAdded: boolWithDefault(state.get(storageKeys.networksAdded(netuid)), false),
+    firstEmissionStarted: state.get(storageKeys.firstEmissionBlockNumber(netuid)) != null,
+    subtokenEnabled: boolWithDefault(state.get(storageKeys.subtokenEnabled(netuid)), false),
+    registrationAllowed: boolWithDefault(state.get(storageKeys.networkRegistrationAllowed(netuid)), true),
+    emissionEnabled: boolWithDefault(state.get(storageKeys.subnetEmissionEnabled(netuid)), true),
+    mechanism: decodeU16(state.get(storageKeys.subnetMechanism(netuid)) ?? null),
+    movingPriceRaw: decodeI96F32Raw(state.get(storageKeys.subnetMovingPrice(netuid)) ?? null),
+    minerBurnedRaw: decodeU96F32Raw(state.get(storageKeys.minerBurned(netuid)) ?? null),
+    alphaInRao: decodeU64(state.get(storageKeys.subnetAlphaIn(netuid)) ?? null),
+    alphaOutRao: decodeU64(state.get(storageKeys.subnetAlphaOut(netuid)) ?? null),
+    priceRaoPerAlpha: prices.get(netuid) ?? null
+  }));
+
+  const gateExponentHex = state.get(globalStorageKeys.emissionGateExponent) ?? null;
+  const gateQuantileHex = state.get(globalStorageKeys.emissionBarQuantile) ?? null;
+  return {
+    totalIssuanceRao: decodeU64(totalIssuanceHex),
+    rootTaoRao: decodeU64(state.get(storageKeys.subnetTao(ROOT_NETUID)) ?? null),
+    taoWeightRaw: decodeU64(taoWeightHex),
+    emissionGateBarRaw: decodeU64F64Raw(state.get(globalStorageKeys.emissionGateBar) ?? null),
+    emissionGateExponentRaw: gateExponentHex == null ? DEFAULT_GATE_EXPONENT_RAW : decodeU64F64Raw(gateExponentHex),
+    emissionBarQuantileRaw: gateQuantileHex == null ? DEFAULT_GATE_QUANTILE_RAW : decodeU64F64Raw(gateQuantileHex),
+    subnets
+  };
+}
+
+/** End-state of block N is the complete pre-coinbase state for block N+1. */
+async function readFormulaSnapshot(rpc: SubtensorRpc, hash: string, candidates: number[]): Promise<TheorySnapshot> {
+  const [state, prices] = await Promise.all([
+    rpc.queryStorage(formulaStorageKeys(candidates), hash),
+    readAlphaPrices(rpc, hash)
+  ]);
+  return decodeFormulaSnapshot(state, candidates, prices);
+}
+
+/**
+ * Read observed outputs and, in the same storage pass, all independent formula
+ * state needed by the next block. Actual injection/Chain Buy are never fed back
+ * into the theory engine.
+ */
 async function readBlockState(rpc: SubtensorRpc, hash: string, blockNumber: number, candidates: number[]): Promise<BlockState> {
-  const keys: string[] = [TIMESTAMP_NOW_KEY];
-  for (const n of candidates) {
-    keys.push(storageKeys.networksAdded(n), storageKeys.taoInEmission(n), storageKeys.excessTao(n), storageKeys.alphaOutEmission(n), storageKeys.rootProp(n));
+  const keys = new Set<string>([TIMESTAMP_NOW_KEY, ...formulaStorageKeys(candidates)]);
+  for (const netuid of candidates) {
+    keys.add(storageKeys.taoInEmission(netuid));
+    keys.add(storageKeys.excessTao(netuid));
   }
-  const state = await rpc.queryStorage(keys, hash);
+  const [state, prices] = await Promise.all([
+    rpc.queryStorage([...keys], hash),
+    readAlphaPrices(rpc, hash)
+  ]);
   const timestampMs = Number(decodeU64(state.get(TIMESTAMP_NOW_KEY) ?? null));
   if (!Number.isSafeInteger(timestampMs) || timestampMs <= 0) throw new Error(`Invalid Timestamp.Now at block ${blockNumber}`);
 
+  const nextFormula = decodeFormulaSnapshot(state, candidates, prices);
   const payload: BlockPayload = {};
   const active: number[] = [];
-  const alphaEmissionByNetuid = new Map<number,bigint>();
-  const currentRootByNetuid = new Map<number,bigint>();
-
-  for (const netuid of candidates) {
-    if (!decodeBool(state.get(storageKeys.networksAdded(netuid)) ?? null)) continue;
-    active.push(netuid);
-    const actual = decodeU64(state.get(storageKeys.taoInEmission(netuid)) ?? null);
-    const chainBuy = decodeU64(state.get(storageKeys.excessTao(netuid)) ?? null);
-    payload[String(netuid)] = [actual.toString(), chainBuy.toString(), null];
-    // AlphaEmission=0 and RootProp=0 are valid formula inputs, not missing values.
-    alphaEmissionByNetuid.set(netuid, decodeU64(state.get(storageKeys.alphaOutEmission(netuid)) ?? null));
-    currentRootByNetuid.set(netuid, decodeU96F32Raw(state.get(storageKeys.rootProp(netuid)) ?? null));
+  for (const subnet of nextFormula.subnets) {
+    if (!subnet.networkAdded) continue;
+    active.push(subnet.netuid);
+    const actual = decodeU64(state.get(storageKeys.taoInEmission(subnet.netuid)) ?? null);
+    const chainBuy = decodeU64(state.get(storageKeys.excessTao(subnet.netuid)) ?? null);
+    payload[String(subnet.netuid)] = [actual.toString(), chainBuy.toString(), null];
   }
-  return { timestampMs, payload, active, alphaEmissionByNetuid, currentRootByNetuid };
+  return { timestampMs, payload, active, nextFormula };
 }
 
-async function readFormulaInputsAtBlock(rpc: SubtensorRpc, hash: string, active: number[]) {
-  const keys: string[] = [];
-  for (const netuid of active) keys.push(storageKeys.alphaOutEmission(netuid), storageKeys.rootProp(netuid));
-  const state = await rpc.queryStorage(keys, hash);
-  const alphaEmissionByNetuid = new Map<number,bigint>();
-  const currentRootByNetuid = new Map<number,bigint>();
-  for (const netuid of active) {
-    alphaEmissionByNetuid.set(netuid, decodeU64(state.get(storageKeys.alphaOutEmission(netuid)) ?? null));
-    currentRootByNetuid.set(netuid, decodeU96F32Raw(state.get(storageKeys.rootProp(netuid)) ?? null));
-  }
-  return { alphaEmissionByNetuid, currentRootByNetuid };
-}
-
-function applyTheory(payload: BlockPayload, active: number[], alphaEmissionByNetuid: Map<number,bigint>, previous: FormulaSnapshot): TheoryStats {
-  let enriched = 0, missingRoot = 0, missingAlpha = 0, missingPrice = 0;
+function applyTheory(payload: BlockPayload, active: number[], previous: TheorySnapshot, blockNumber: number): TheoryStats {
+  let enriched = 0, missingPrice = 0;
+  const results = calculateIndependentTheory(previous, blockNumber);
   for (const netuid of active) {
     const value = payload[String(netuid)];
     if (!value) continue;
-    const rootRaw = previous.rootByNetuid.get(netuid);
-    const alphaEmission = alphaEmissionByNetuid.get(netuid);
-    const price = previous.priceByNetuid.get(netuid);
-    if (rootRaw == null) { missingRoot++; continue; }
-    if (alphaEmission == null) { missingAlpha++; continue; }
-    if (price == null || price <= 0n) { missingPrice++; continue; }
-    const theory = calculateTheoreticalInjectedRao({
-      availableTaoEmissionRao: BigInt(value[0]) + BigInt(value[1]),
-      rootProportionRaw: rootRaw,
-      alphaEmissionRao: alphaEmission,
-      priceRaoPerAlpha: price
-    });
-    if (theory == null) continue;
-    value[2] = theory.toString();
+    const theory = results.get(netuid);
+    if (!theory) continue;
+    if (theory.theoreticalInjectedRao == null) {
+      if (theory.missingPrice) missingPrice++;
+      continue;
+    }
+    value[2] = theory.theoreticalInjectedRao.toString();
     enriched++;
   }
-  return { enriched, missingRoot, missingAlpha, missingPrice };
+  return { enriched, missingRoot: 0, missingAlpha: 0, missingPrice };
 }
 
 async function syncRegistry(env: Env, rpc: SubtensorRpc, hash: string, blockNumber: number, candidates: number[], active: number[]) {
@@ -206,12 +259,17 @@ async function syncRegistry(env: Env, rpc: SubtensorRpc, hash: string, blockNumb
   return { added, removed };
 }
 
+/**
+ * Recalculate retained V4/V5 rows with the independent V6 model. Historical
+ * actual injection and Chain Buy are preserved; only payload[2] is replaced.
+ */
 async function backfillTheory(env: Env, rpc: SubtensorRpc, batchSize = THEORY_BACKFILL_BATCH): Promise<void> {
   const formulaVersion = await getState(env.META_DB, 'theory_formula_version');
   let cursorState = await getState(env.META_DB, 'theory_backfill_cursor');
-  if (formulaVersion !== THEORY_FORMULA_VERSION || cursorState == null) {
+  if (formulaVersion !== THEORY_FORMULA_VERSION) {
     const earliest = await getEarliestStoredBlockNumber(env);
     await setState(env.META_DB, 'theory_formula_version', THEORY_FORMULA_VERSION);
+    await env.META_DB.prepare("DELETE FROM sync_state WHERE key IN ('theory_backfill_error','theory_backfill_missing_root','theory_backfill_missing_alpha','theory_backfill_missing_price')").run();
     if (earliest == null) {
       await setState(env.META_DB, 'theory_backfill_status', 'complete');
       return;
@@ -219,6 +277,10 @@ async function backfillTheory(env: Env, rpc: SubtensorRpc, batchSize = THEORY_BA
     cursorState = String(earliest - 1);
     await setState(env.META_DB, 'theory_backfill_cursor', cursorState);
     await setState(env.META_DB, 'theory_backfill_status', 'running');
+  } else if (cursorState == null) {
+    const earliest = await getEarliestStoredBlockNumber(env);
+    cursorState = String((earliest ?? 1) - 1);
+    await setState(env.META_DB, 'theory_backfill_cursor', cursorState);
   }
 
   let cursor = Number(cursorState);
@@ -229,37 +291,31 @@ async function backfillTheory(env: Env, rpc: SubtensorRpc, batchSize = THEORY_BA
     return;
   }
 
-  let previousFormula: FormulaSnapshot | null = null;
-  let previousBlock = -1;
   let processed = 0;
   const touchedHours = new Set<number>();
-
   for (const row of rows) {
     const payload = JSON.parse(row.payload) as BlockPayload;
-    const active = Object.keys(payload).map(Number).filter(n => Number.isInteger(n) && n > 0);
-    if (!active.length) {
-      cursor = row.block_number; processed++;
+    const candidates = Object.keys(payload).map(Number).filter(n => Number.isInteger(n) && n > 0);
+    if (!candidates.length) {
+      cursor = row.block_number;
+      processed++;
       await setState(env.META_DB, 'theory_backfill_cursor', String(cursor));
       continue;
     }
-    if (previousFormula == null || row.block_number !== previousBlock + 1) {
-      const header = await rpc.header(row.block_hash);
-      previousFormula = await readFormulaSnapshot(rpc, header.parentHash, active);
-    }
-    const inputs = await readFormulaInputsAtBlock(rpc, row.block_hash, active);
-    const stats = applyTheory(payload, active, inputs.alphaEmissionByNetuid, previousFormula);
+
+    const header = await rpc.header(row.block_hash);
+    const previousFormula = await readFormulaSnapshot(rpc, header.parentHash, candidates);
+    const stats = applyTheory(payload, candidates, previousFormula, row.block_number);
     await setState(env.META_DB, 'theory_backfill_missing_root', String(stats.missingRoot));
     await setState(env.META_DB, 'theory_backfill_missing_alpha', String(stats.missingAlpha));
     await setState(env.META_DB, 'theory_backfill_missing_price', String(stats.missingPrice));
-    if (stats.enriched !== active.length) {
+    if (stats.enriched !== candidates.length) {
       await setState(env.META_DB, 'theory_backfill_status', 'partial');
       break;
     }
 
     await updateBlockPayload(env, row.block_number, row.timestamp_ms, payload);
     touchedHours.add(Math.floor(row.timestamp_ms / HOUR_MS) * HOUR_MS);
-    previousFormula = { rootByNetuid: inputs.currentRootByNetuid, priceByNetuid: await readAlphaPrices(rpc, row.block_hash) };
-    previousBlock = row.block_number;
     cursor = row.block_number;
     processed++;
     await setState(env.META_DB, 'theory_backfill_cursor', String(cursor));
@@ -301,13 +357,13 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
         const hash = block === finalizedBlock ? finalizedHash : await rpc.blockHash(block);
         if (!hash) throw new Error(`Missing block hash for ${block}`);
         const state = await readBlockState(rpc, hash, block, candidates);
-        lastTheory = applyTheory(state.payload, state.active, state.alphaEmissionByNetuid, previousFormula);
+        lastTheory = applyTheory(state.payload, state.active, previousFormula, block);
         if (await storeBlock(env, block, hash, state.timestampMs, state.payload)) stored++;
         else if (lastTheory.enriched > 0) await updateBlockPayload(env, block, state.timestampMs, state.payload);
         await setState(env.META_DB, 'last_finalized_block', String(block));
         await setState(env.META_DB, 'last_sync_ms', String(Date.now()));
         if (lastTheory.enriched > 0) await setState(env.META_DB, 'theory_last_block', String(block));
-        previousFormula = { rootByNetuid: state.currentRootByNetuid, priceByNetuid: await readAlphaPrices(rpc, hash) };
+        previousFormula = state.nextFormula;
       }
     }
 
@@ -317,8 +373,6 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
     await setState(env.META_DB, 'theory_last_missing_alpha', String(lastTheory.missingAlpha));
     await setState(env.META_DB, 'theory_last_missing_price', String(lastTheory.missingPrice));
 
-    // Backfill is independent from the live cursor. Each invocation advances a
-    // bounded batch, so normal collection stays responsive while old null rows disappear.
     try { await backfillTheory(env, rpc); }
     catch (error) {
       await setState(env.META_DB, 'theory_backfill_status', 'error');
