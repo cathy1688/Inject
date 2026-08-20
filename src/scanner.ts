@@ -2,7 +2,7 @@ import type { BlockPayload, Env, SubnetRecord } from './types';
 import { SubtensorRpc, parseBlockNumber } from './rpc';
 import { PREFIX, TIMESTAMP_NOW_KEY, decodeBool, decodeFirstVecUtf8, decodeU64, netuidFromBlake2ConcatStorageKey, netuidFromIdentityStorageKey, storageKeys } from './storage';
 import { calculateTheoreticalInjectedRao } from './theory';
-import { getState, listKnownNetuids, setState, storeBlock, updateSummariesForNewBlocks, upsertSubnets } from './db';
+import { ensureClosedHourlySummaries, getState, listKnownNetuids, setState, storeBlock, upsertSubnets } from './db';
 
 const DEFAULT_WS = 'wss://entrypoint-finney.opentensor.ai:443';
 
@@ -101,13 +101,12 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
 
     const saved = Number(await getState(env.META_DB, 'last_finalized_block') ?? '0');
     let start = saved > 0 ? saved + 1 : finalizedBlock;
-    // Safety: never make a single free-plan invocation do an unbounded catch-up.
+    // Keep a single free-plan invocation bounded; subsequent cron runs continue from the cursor.
     start = Math.max(start, finalizedBlock - Math.max(1, maxBlocks) + 1);
 
     const known = await listKnownNetuids(env.META_DB);
     const candidates = await discoverCandidateNetuids(rpc, finalizedHash, known);
     let stored = 0;
-    const newBlocks: Array<{timestampMs:number;payload:BlockPayload}> = [];
     let lastActive: number[] = [];
 
     for (let block = start; block <= finalizedBlock; block++) {
@@ -115,15 +114,14 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
       if (!hash) throw new Error(`Missing block hash for ${block}`);
       const state = await readBlockState(rpc, hash, block, candidates);
       lastActive = state.active;
-      if (await storeBlock(env, block, hash, state.timestampMs, state.payload)) {
-        stored++;
-        newBlocks.push({timestampMs:state.timestampMs,payload:state.payload});
-      }
+      if (await storeBlock(env, block, hash, state.timestampMs, state.payload)) stored++;
+      // The cursor advances only after the block write succeeds. A failure is retried next run.
       await setState(env.META_DB, 'last_finalized_block', String(block));
       await setState(env.META_DB, 'last_sync_ms', String(Date.now()));
     }
 
-    await updateSummariesForNewBlocks(env.META_DB, newBlocks);
+    const latestTimestampMs = Number(decodeU64((await rpc.queryStorage([TIMESTAMP_NOW_KEY], finalizedHash)).get(TIMESTAMP_NOW_KEY) ?? null));
+    if (latestTimestampMs > 0) await ensureClosedHourlySummaries(env, latestTimestampMs);
     const registry = await syncRegistry(env, rpc, finalizedHash, finalizedBlock, candidates, lastActive);
     await setState(env.META_DB, 'rpc_status', 'ok');
     await setState(env.META_DB, 'chain_finalized_block', String(finalizedBlock));
