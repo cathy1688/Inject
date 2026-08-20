@@ -1,9 +1,8 @@
 import type { BlockPayload, Env, SubnetRecord, SubnetSummaryValue, SummaryPayload } from './types';
 
-export const MINUTE_MS = 60_000;
 export const HOUR_MS = 3_600_000;
 export const DAY_MS = 86_400_000;
-const SHARD_WINDOW_MS = 8 * DAY_MS; // 4 shards = 32-day rotation; retention is 30 days.
+const SHARD_WINDOW_MS = 8 * DAY_MS;
 
 export function blockDatabases(env: Env): D1Database[] {
   return [env.BLOCKS_0, env.BLOCKS_1, env.BLOCKS_2, env.BLOCKS_3];
@@ -21,11 +20,10 @@ export async function getState(db: D1Database, key: string): Promise<string | nu
 }
 
 export async function setState(db: D1Database, key: string, value: string): Promise<void> {
-  const now = Date.now();
   await db.prepare(`
     INSERT INTO sync_state(key,value,updated_at_ms) VALUES(?,?,?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at_ms=excluded.updated_at_ms
-  `).bind(key, value, now).run();
+  `).bind(key, value, Date.now()).run();
 }
 
 export async function listKnownNetuids(db: D1Database): Promise<number[]> {
@@ -50,11 +48,12 @@ export async function upsertSubnets(db: D1Database, rows: SubnetRecord[]): Promi
 
 export async function storeBlock(env: Env, blockNumber: number, blockHash: string, timestampMs: number, payload: BlockPayload): Promise<boolean> {
   const db = blockDbForTimestamp(env, timestampMs);
-  const exists = await db.prepare('SELECT 1 AS ok FROM blocks WHERE block_number = ?').bind(blockNumber).first<{ ok: number }>();
-  if (exists) return false;
-  await db.prepare('INSERT INTO blocks(block_number,block_hash,timestamp_ms,payload,created_at_ms) VALUES(?,?,?,?,?)')
-    .bind(blockNumber, blockHash, timestampMs, JSON.stringify(payload), Date.now()).run();
-  return true;
+  const result = await db.prepare(`
+    INSERT OR IGNORE INTO blocks(block_number,block_hash,timestamp_ms,payload,created_at_ms)
+    VALUES(?,?,?,?,?)
+  `).bind(blockNumber, blockHash, timestampMs, JSON.stringify(payload), Date.now()).run();
+  const changes = Number((result.meta as {changes?: number} | undefined)?.changes ?? 0);
+  return changes > 0;
 }
 
 function emptySummary(value: [string,string,string|null]): SubnetSummaryValue {
@@ -83,47 +82,41 @@ export function mergeSummaries(target: SummaryPayload, source: SummaryPayload): 
   }
 }
 
-async function mergeSummaryRow(db: D1Database, table: 'minute_summary'|'hourly_summary'|'daily_summary', startMs: number, addition: SummaryPayload, blockCount: number): Promise<void> {
-  const row = await db.prepare(`SELECT payload FROM ${table} WHERE period_start_ms=?`).bind(startMs).first<{payload:string}>();
-  const merged: SummaryPayload = row?.payload ? JSON.parse(row.payload) as SummaryPayload : {};
-  mergeSummaries(merged, addition);
-  await db.prepare(`
-    INSERT INTO ${table}(period_start_ms,payload,block_count,updated_at_ms) VALUES(?,?,?,?)
-    ON CONFLICT(period_start_ms) DO UPDATE SET payload=excluded.payload, block_count=${table}.block_count+excluded.block_count, updated_at_ms=excluded.updated_at_ms
-  `).bind(startMs, JSON.stringify(merged), blockCount, Date.now()).run();
+export async function rebuildHourlySummary(env: Env, periodStartMs: number): Promise<void> {
+  const periodEndMs = periodStartMs + HOUR_MS;
+  const summary: SummaryPayload = {};
+  let blocks = 0;
+  for (const db of blockDatabases(env)) {
+    const result = await db.prepare('SELECT payload FROM blocks WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms')
+      .bind(periodStartMs, periodEndMs).all<{payload:string}>();
+    blocks += result.results.length;
+    for (const row of result.results) addBlockToSummary(summary, JSON.parse(row.payload) as BlockPayload);
+  }
+  await env.META_DB.prepare(`
+    INSERT INTO hourly_summary(period_start_ms,payload,block_count,updated_at_ms) VALUES(?,?,?,?)
+    ON CONFLICT(period_start_ms) DO UPDATE SET payload=excluded.payload, block_count=excluded.block_count, updated_at_ms=excluded.updated_at_ms
+  `).bind(periodStartMs, JSON.stringify(summary), blocks, Date.now()).run();
 }
 
-export async function updateSummariesForNewBlocks(metaDb: D1Database, newBlocks: Array<{timestampMs:number; payload:BlockPayload}>): Promise<void> {
-  if (!newBlocks.length) return;
-  const minute = new Map<number,{payload:SummaryPayload; blocks:number}>();
-  const hour = new Map<number,{payload:SummaryPayload; blocks:number}>();
-  const day = new Map<number,{payload:SummaryPayload; blocks:number}>();
-
-  const add = (map: Map<number,{payload:SummaryPayload;blocks:number}>, period: number, block: BlockPayload) => {
-    const entry = map.get(period) ?? {payload:{},blocks:0};
-    addBlockToSummary(entry.payload, block);
-    entry.blocks++;
-    map.set(period,entry);
-  };
-
-  for (const block of newBlocks) {
-    add(minute, Math.floor(block.timestampMs/MINUTE_MS)*MINUTE_MS, block.payload);
-    add(hour, Math.floor(block.timestampMs/HOUR_MS)*HOUR_MS, block.payload);
-    add(day, Math.floor(block.timestampMs/DAY_MS)*DAY_MS, block.payload);
+/** Build every closed hour exactly once; retries are idempotent because rows are replaced. */
+export async function ensureClosedHourlySummaries(env: Env, latestTimestampMs: number): Promise<void> {
+  const currentHour = Math.floor(latestTimestampMs / HOUR_MS) * HOUR_MS;
+  const state = await getState(env.META_DB, 'next_hourly_summary_ms');
+  if (state == null) {
+    await setState(env.META_DB, 'next_hourly_summary_ms', String(currentHour));
+    return;
   }
-  for (const [p,v] of minute) await mergeSummaryRow(metaDb,'minute_summary',p,v.payload,v.blocks);
-  for (const [p,v] of hour) await mergeSummaryRow(metaDb,'hourly_summary',p,v.payload,v.blocks);
-  for (const [p,v] of day) await mergeSummaryRow(metaDb,'daily_summary',p,v.payload,v.blocks);
+  let next = Number(state);
+  while (Number.isFinite(next) && next < currentHour) {
+    await rebuildHourlySummary(env, next);
+    next += HOUR_MS;
+    await setState(env.META_DB, 'next_hourly_summary_ms', String(next));
+  }
 }
 
 export async function cleanupOldData(env: Env, retentionDays: number): Promise<void> {
   const cutoff = Date.now() - retentionDays * DAY_MS;
   for (const db of blockDatabases(env)) await db.prepare('DELETE FROM blocks WHERE timestamp_ms < ?').bind(cutoff).run();
-  const dayCutoff = Math.floor(cutoff/DAY_MS)*DAY_MS;
-  await env.META_DB.batch([
-    env.META_DB.prepare('DELETE FROM minute_summary WHERE period_start_ms < ?').bind(cutoff),
-    env.META_DB.prepare('DELETE FROM hourly_summary WHERE period_start_ms < ?').bind(cutoff),
-    env.META_DB.prepare('DELETE FROM daily_summary WHERE period_start_ms < ?').bind(dayCutoff)
-  ]);
+  await env.META_DB.prepare('DELETE FROM hourly_summary WHERE period_start_ms < ?').bind(Math.floor(cutoff/HOUR_MS)*HOUR_MS).run();
   await setState(env.META_DB, 'last_cleanup_ms', String(Date.now()));
 }
