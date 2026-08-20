@@ -5,6 +5,11 @@ interface JsonRpcResponse<T> {
   error?: { code: number; message: string; data?: unknown };
 }
 
+interface StorageChangeSet {
+  block: string;
+  changes: Array<[string, string | null]>;
+}
+
 export interface RpcSubnetPrice {
   netuid: number;
   price: number | string;
@@ -45,7 +50,7 @@ export class SubtensorRpc {
           else waiter.resolve(msg.result);
         }
       } catch {
-        // Ignore non-JSON notifications. We do not subscribe in this client.
+        // Ignore non-JSON notifications. This client does not subscribe.
       }
     });
 
@@ -81,43 +86,34 @@ export class SubtensorRpc {
     return prepared.promise;
   }
 
-  async batch<T>(calls: Array<{ method: string; params?: unknown[] }>): Promise<T[]> {
-    if (!calls.length) return [];
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) await this.connect();
-    const ws = this.ws;
-    if (!ws) throw new Error('WebSocket not initialized');
-    const prepared = calls.map(call => ({ call, waiter: this.prepare<T>(call.method) }));
-    ws.send(JSON.stringify(prepared.map(x => ({ jsonrpc: '2.0', id: x.waiter.id, method: x.call.method, params: x.call.params ?? [] }))));
-    return Promise.all(prepared.map(x => x.waiter.promise));
-  }
-
   finalizedHead(): Promise<string> { return this.call<string>('chain_getFinalizedHead'); }
   async header(hash: string): Promise<{ number: string; parentHash: string }> { return this.call('chain_getHeader', [hash]); }
   blockHash(blockNumber: number): Promise<string | null> { return this.call<string | null>('chain_getBlockHash', [blockNumber]); }
 
-  /** Bittensor v443 exposes this decoded RPC directly, including an optional historical hash. */
   currentAlphaPricesAll(atHash: string): Promise<RpcSubnetPrice[]> {
     return this.call<RpcSubnetPrice[]>('swap_currentAlphaPriceAll', [atHash]);
   }
 
-  /** Raw runtime API fallback for endpoints that do not expose the decoded swap RPC. */
   currentAlphaPricesAllScale(atHash: string): Promise<string> {
     return this.call<string>('state_call', ['SwapRuntimeApi_current_alpha_price_all', '0x', atHash]);
   }
 
   /**
-   * Read the full storage state for every requested key at one block.
-   * Do not use state_queryStorageAt here: the monitor needs complete values,
-   * not a change-set style response, otherwise inactive/unchanged keys can be
-   * misclassified and per-block emission becomes incomplete.
+   * Query many storage keys in one normal JSON-RPC request. The public Finney
+   * endpoint timed out on JSON-RPC batch arrays of many `state_getStorage`
+   * requests. Substrate exposes `state_queryStorageAt` specifically for
+   * querying a vector of storage keys at one block.
    */
   async queryStorage(keys: string[], atHash: string): Promise<Map<string, string | null>> {
     const map = new Map<string, string | null>();
-    const chunkSize = 96;
+    const chunkSize = 256;
     for (let i = 0; i < keys.length; i += chunkSize) {
       const chunk = keys.slice(i, i + chunkSize);
-      const values = await this.batch<string | null>(chunk.map(key => ({ method: 'state_getStorage', params: [key, atHash] })));
-      chunk.forEach((key, index) => map.set(key, values[index] ?? null));
+      chunk.forEach(key => map.set(key, null));
+      const sets = await this.call<StorageChangeSet[]>('state_queryStorageAt', [chunk, atHash]);
+      for (const set of sets ?? []) {
+        for (const [key, value] of set.changes ?? []) map.set(key, value);
+      }
     }
     return map;
   }
@@ -126,11 +122,11 @@ export class SubtensorRpc {
     const all: string[] = [];
     let startKey: string | null = null;
     while (true) {
-      const page: string[] = await this.call<string[]>('state_getKeysPaged', [prefix, pageSize, startKey, atHash]);
+      const page = await this.call<string[]>('state_getKeysPaged', [prefix, pageSize, startKey, atHash]);
       if (!page?.length) break;
       all.push(...page);
       if (page.length < pageSize) break;
-      const next: string = page[page.length - 1];
+      const next = page[page.length - 1];
       if (next === startKey) break;
       startKey = next;
     }
