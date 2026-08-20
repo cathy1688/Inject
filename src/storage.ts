@@ -7,6 +7,8 @@ const ITEMS = {
   networksAdded: '0e30450fc4d507a846032a7fa65d9a43',
   taoInEmission: 'dd62ae7237581e8f6a684f1ecae06215',
   excessTao: '857b0a5b920bc5e41cb0695a4b7d38e7',
+  alphaOutEmission: '25257fbc5458419b7bc7e8c44c521521',
+  rootProp: '010cf3b550f933211beccf08e00433e4',
   registeredSubnetCounter: '29b0b4bcda192c1cf596d879a4e873a6',
   subnetIdentitiesV3: 'c7cb9786b286b680ca204a6c0920ee52',
   timestampNow: '9f1f0515f462cdcf84e0f1d6045dfcbb'
@@ -32,6 +34,8 @@ export const storageKeys = {
   networksAdded: (netuid: number) => identityMapKey(ITEMS.networksAdded, netuid),
   taoInEmission: (netuid: number) => identityMapKey(ITEMS.taoInEmission, netuid),
   excessTao: (netuid: number) => identityMapKey(ITEMS.excessTao, netuid),
+  alphaOutEmission: (netuid: number) => identityMapKey(ITEMS.alphaOutEmission, netuid),
+  rootProp: (netuid: number) => identityMapKey(ITEMS.rootProp, netuid),
   registeredSubnetCounter: (netuid: number) => identityMapKey(ITEMS.registeredSubnetCounter, netuid)
 };
 
@@ -45,7 +49,6 @@ export function netuidFromIdentityStorageKey(key: string): number | null {
 }
 
 export function netuidFromBlake2ConcatStorageKey(key: string): number | null {
-  // Blake2_128Concat appends the original SCALE-encoded key after 16 hash bytes.
   return netuidFromIdentityStorageKey(key);
 }
 
@@ -63,12 +66,20 @@ export function decodeBool(hexValue: string | null): boolean {
   return bytes.length > 0 && bytes[0] !== 0;
 }
 
-export function decodeU64(hexValue: string | null): bigint {
-  const bytes = hexToBytes(hexValue);
+function decodeUnsignedLe(bytes: Uint8Array, maxBytes: number): bigint {
   let value = 0n;
-  const limit = Math.min(bytes.length, 8);
+  const limit = Math.min(bytes.length, maxBytes);
   for (let i = 0; i < limit; i++) value |= BigInt(bytes[i]) << BigInt(i * 8);
   return value;
+}
+
+export function decodeU64(hexValue: string | null): bigint {
+  return decodeUnsignedLe(hexToBytes(hexValue), 8);
+}
+
+/** U96F32 is stored as a 128-bit little-endian fixed point value with 32 fractional bits. */
+export function decodeU96F32Raw(hexValue: string | null): bigint {
+  return decodeUnsignedLe(hexToBytes(hexValue), 16);
 }
 
 function decodeCompact(bytes: Uint8Array, offset = 0): { value: number; next: number } | null {
@@ -90,6 +101,24 @@ function decodeCompact(bytes: Uint8Array, offset = 0): { value: number; next: nu
   let value = 0;
   for (let i = 0; i < byteLen; i++) value += bytes[offset + 1 + i] * 2 ** (8 * i);
   return { value, next: offset + 1 + byteLen };
+}
+
+/** Decode SCALE Vec<SubnetPrice>, where SubnetPrice = { netuid: u16, price: u64 }. */
+export function decodeSubnetPrices(hexValue: string | null): Map<number, bigint> {
+  const bytes = hexToBytes(hexValue);
+  const length = decodeCompact(bytes, 0);
+  const prices = new Map<number, bigint>();
+  if (!length) return prices;
+  let offset = length.next;
+  for (let i = 0; i < length.value; i++) {
+    if (offset + 10 > bytes.length) break;
+    const netuid = bytes[offset] | (bytes[offset + 1] << 8);
+    offset += 2;
+    const price = decodeUnsignedLe(bytes.slice(offset, offset + 8), 8);
+    offset += 8;
+    prices.set(netuid, price);
+  }
+  return prices;
 }
 
 export function decodeFirstVecUtf8(hexValue: string | null): string | null {

@@ -90,6 +90,16 @@ export class SubtensorRpc {
   async header(hash: string): Promise<{ number: string; parentHash: string }> { return this.call('chain_getHeader', [hash]); }
   blockHash(blockNumber: number): Promise<string | null> { return this.call<string | null>('chain_getBlockHash', [blockNumber]); }
 
+  /** Call a runtime API against an exact historical state. */
+  stateCall(runtimeMethod: string, data: string, atHash: string): Promise<string> {
+    return this.call<string>('state_call', [runtimeMethod, data, atHash]);
+  }
+
+  /** SCALE Vec<SubnetPrice>; each price is TAO/alpha scaled by 1e9 in the runtime API. */
+  currentAlphaPricesAll(atHash: string): Promise<string> {
+    return this.stateCall('SwapRuntimeApi_current_alpha_price_all', '0x', atHash);
+  }
+
   /**
    * Read the full storage state for every requested key at one block.
    * Do not use state_queryStorageAt here: the monitor needs complete values,

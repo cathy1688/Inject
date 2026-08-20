@@ -30,7 +30,7 @@ async function status(env: Env): Promise<Response> {
     getState(db,'last_finalized_block'), getState(db,'chain_finalized_block'), getState(db,'last_sync_ms'),
     getState(db,'rpc_status'), getState(db,'last_error'), getState(db,'registry_added_last'), getState(db,'registry_removed_last')
   ]);
-  const active = await db.prepare("SELECT COUNT(*) AS n FROM subnets WHERE status='active'").first<{n:number}>();
+  const active = await db.prepare("SELECT COUNT(*) AS n FROM subnets WHERE status='active' AND netuid > 0").first<{n:number}>();
   return json({
     rpcStatus: rpcStatus ?? 'unknown',
     lastFinalizedBlock: Number(last ?? 0),
@@ -40,13 +40,13 @@ async function status(env: Env): Promise<Response> {
     addedLastSync: Number(added ?? 0),
     removedLastSync: Number(removed ?? 0),
     lastError: error ?? null,
-    theoryEnabled: false,
+    theoryEnabled: true,
     retentionDays: Number(env.RETENTION_DAYS ?? '30')
   });
 }
 
 async function subnets(env: Env): Promise<Response> {
-  const result = await env.META_DB.prepare('SELECT netuid,registration_counter,name,status,first_seen_block,last_seen_block,updated_at_ms FROM subnets ORDER BY netuid').all();
+  const result = await env.META_DB.prepare('SELECT netuid,registration_counter,name,status,first_seen_block,last_seen_block,updated_at_ms FROM subnets WHERE netuid > 0 ORDER BY netuid').all();
   return json({ items: result.results });
 }
 
@@ -86,7 +86,7 @@ async function subnetsSummary(req: Request, env: Env): Promise<Response> {
   const to = parseTime(url.searchParams.get('to'), now);
   if (from > to) return bad('from must be <= to');
   const summary=await aggregateRange(env,from,to);
-  const subnetRows = await env.META_DB.prepare('SELECT netuid,name,status FROM subnets ORDER BY netuid').all<{netuid:number;name:string;status:string}>();
+  const subnetRows = await env.META_DB.prepare('SELECT netuid,name,status FROM subnets WHERE netuid > 0 ORDER BY netuid').all<{netuid:number;name:string;status:string}>();
   const items=subnetRows.results.map(meta=>{
     const v=summary[String(meta.netuid)] ?? ['0','0',null,0];
     const actual=Number(v[0]), chain=Number(v[1]), theory=v[2]==null?null:Number(v[2]);
@@ -129,7 +129,7 @@ async function blockSegments(env:Env,netuid:number,from:number,to:number,q:strin
 async function blocks(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const netuid = Number(url.searchParams.get('netuid'));
-  if (!Number.isInteger(netuid) || netuid < 0 || netuid > 65535) return bad('invalid netuid');
+  if (!Number.isInteger(netuid) || netuid <= 0 || netuid > 65535) return bad('invalid subnet netuid');
   const now = Date.now();
   const from = parseTime(url.searchParams.get('from'), now - DAY_MS);
   const to = parseTime(url.searchParams.get('to'), now);
@@ -166,7 +166,7 @@ async function blocks(req: Request, env: Env): Promise<Response> {
 async function chart(req: Request, env: Env): Promise<Response> {
   const url = new URL(req.url);
   const netuid = Number(url.searchParams.get('netuid'));
-  if (!Number.isInteger(netuid)) return bad('invalid netuid');
+  if (!Number.isInteger(netuid) || netuid <= 0) return bad('invalid subnet netuid');
   const now=Date.now();
   const from=parseTime(url.searchParams.get('from'),now-DAY_MS), to=parseTime(url.searchParams.get('to'),now);
   const key=`$."${netuid}"`;
@@ -186,7 +186,7 @@ async function chart(req: Request, env: Env): Promise<Response> {
 async function exportCsv(req: Request, env: Env): Promise<Response> {
   const url=new URL(req.url);
   const netuid=Number(url.searchParams.get('netuid'));
-  if(!Number.isInteger(netuid)) return bad('invalid netuid');
+  if(!Number.isInteger(netuid) || netuid <= 0) return bad('invalid subnet netuid');
   const now=Date.now(),from=parseTime(url.searchParams.get('from'),now-DAY_MS),to=parseTime(url.searchParams.get('to'),now);
   const fakeUrl=new URL(req.url); fakeUrl.pathname='/api/blocks'; fakeUrl.searchParams.set('limit','5000'); fakeUrl.searchParams.set('offset','0');
   const all:Array<Record<string,unknown>>=[];
