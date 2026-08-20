@@ -28,6 +28,7 @@ const TOTAL_SUPPLY_RAO = 21_000_000_000_000_000n;
 const DEFAULT_BLOCK_EMISSION_RAO = 1_000_000_000n;
 const PRICE_SCALE = 1_000_000_000n;
 
+export const THEORY_MODEL_VERSION = '7-independent-rank';
 export const DEFAULT_GATE_RANK = 32;
 export const DEFAULT_GATE_EXPONENT_RAW = 3n * FIXED_64;
 export const DEFAULT_GATE_QUANTILE_RAW = (61n * FIXED_64) / 100n;
@@ -89,10 +90,7 @@ export function blockEmissionForIssuanceRao(issuanceRao: bigint): bigint {
   return emission;
 }
 
-/**
- * Reconstruct `root_proportion()` using the runtime's U96F32 operations.
- * This deliberately does not read the cached RootProp storage value.
- */
+/** Reconstruct `root_proportion()` without reading cached RootProp. */
 export function calculateRootProportionRaw(
   rootTaoRao: bigint,
   taoWeightRaw: bigint,
@@ -101,9 +99,7 @@ export function calculateRootProportionRaw(
   if (rootTaoRao <= 0n || taoWeightRaw <= 0n) return 0n;
   if (alphaIssuanceRao < 0n) return 0n;
 
-  // get_tao_weight(): U96F32(stored_weight) / U96F32(u64::MAX)
   const taoWeightQ32 = (taoWeightRaw << 32n) / U64_MAX;
-  // U96F32(root_tao) * tao_weight. Fixed multiply drops 32 fractional bits.
   const weightedRootRaw = rootTaoRao * taoWeightQ32;
   const alphaRaw = alphaIssuanceRao << 32n;
   const denominator = weightedRootRaw + alphaRaw;
@@ -120,8 +116,6 @@ export interface InjectionInput {
 
 export function calculateInjectionCapRao(input: Omit<InjectionInput, 'nominalTaoEmissionRao'>): bigint | null {
   if (input.rootProportionRaw < 0n || input.alphaEmissionRao < 0n) return null;
-  // A zero root proportion or zero alpha emission makes the cap exactly zero;
-  // spot price is irrelevant in that case.
   if (input.rootProportionRaw === 0n || input.alphaEmissionRao === 0n) return 0n;
   if (input.priceRaoPerAlpha == null || input.priceRaoPerAlpha <= 0n) return null;
 
@@ -143,7 +137,6 @@ function eligible(subnet: TheorySubnetState): boolean {
 
 function normalizedPriceShares(subnets: TheorySubnetState[]): Map<number, number> {
   const prices = subnets.map(subnet => {
-    // Runtime `get_moving_alpha_price`: stable mechanism 0 has price 1.
     const price = subnet.mechanism === 0 ? 1 : Math.max(0, fixed32ToNumber(subnet.movingPriceRaw));
     return [subnet.netuid, Number.isFinite(price) ? price : 0] as const;
   });
@@ -183,7 +176,6 @@ function gatedShares(
   quantile: number,
   exponent: number
 ): Map<number, number> {
-  // Runtime refreshes theta every 360 blocks, or whenever the stored bar is zero.
   const theta = storedBar > 0 && blockNumber % 360 !== 0
     ? storedBar
     : selectGateBar(weighted, rank, quantile);
@@ -224,10 +216,7 @@ function redistributeDisabled(subnets: TheorySubnetState[], shares: Map<number, 
   return out;
 }
 
-/**
- * Fully independent per-subnet theoretical terms for block `blockNumber`.
- * `snapshot` must be the end-state of the parent block.
- */
+/** Fully independent per-subnet theoretical terms for block `blockNumber`. */
 export function calculateIndependentTheory(snapshot: TheorySnapshot, blockNumber: number): Map<number, TheorySubnetResult> {
   const emitting = snapshot.subnets.filter(eligible);
   const priceShares = normalizedPriceShares(emitting);
@@ -256,11 +245,7 @@ export function calculateIndependentTheory(snapshot: TheorySnapshot, blockNumber
   for (const subnet of snapshot.subnets) {
     const alphaIssuanceRao = subnet.alphaInRao + subnet.alphaOutRao;
     const alphaEmissionRao = blockEmissionForIssuanceRao(alphaIssuanceRao);
-    const rootProportionRaw = calculateRootProportionRaw(
-      snapshot.rootTaoRao,
-      snapshot.taoWeightRaw,
-      alphaIssuanceRao
-    );
+    const rootProportionRaw = calculateRootProportionRaw(snapshot.rootTaoRao, snapshot.taoWeightRaw, alphaIssuanceRao);
     const nominalTaoEmissionRao = nominalByNetuid.get(subnet.netuid) ?? 0n;
     const theoreticalInjectedRao = calculateTheoreticalInjectedRao({
       nominalTaoEmissionRao,
