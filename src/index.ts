@@ -5,14 +5,13 @@ import { scanToFinalized } from './scanner';
 import { ensureSchema } from './schema';
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api/')) {
       await ensureSchema(env);
-      // Query-time catch-up keeps the dashboard close to the latest finalized block.
-      if (request.method === 'GET' && url.pathname !== '/api/status') {
-        ctx.waitUntil(scanToFinalized(env, 8).catch(() => undefined));
-      }
+      // Live catch-up is explicit through POST /api/sync. Read-only API calls do
+      // not start extra scanners, preventing concurrent duplicate work when the
+      // browser refreshes several dashboard modules at once.
       return handleApi(request, env);
     }
     return env.ASSETS.fetch(request);
