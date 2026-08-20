@@ -3,12 +3,14 @@ import { handleApi } from './api';
 import { cleanupOldData } from './db';
 import { scanToFinalized } from './scanner';
 import { ensureSchema } from './schema';
+import { theoryDebug } from './theory-debug';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api/')) {
       await ensureSchema(env);
+      if (url.pathname === '/api/theory-debug') return theoryDebug(request, env);
       // Query-time catch-up keeps the dashboard close to the latest finalized block.
       if (request.method === 'GET' && url.pathname !== '/api/status') {
         ctx.waitUntil(scanToFinalized(env, 8).catch(() => undefined));
