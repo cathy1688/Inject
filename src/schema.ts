@@ -1,6 +1,6 @@
 import type { Env } from './types';
 
-const DATA_VERSION = '3';
+const DATA_VERSION = '4';
 
 const META_SCHEMA = [
   `CREATE TABLE IF NOT EXISTS subnets (
@@ -47,9 +47,10 @@ async function ensureDataVersion(env: Env): Promise<void> {
   const row = await env.META_DB.prepare("SELECT value FROM sync_state WHERE key='data_version'").first<{value:string}>();
   if (row?.value === DATA_VERSION) return;
 
-  // v3 starts a clean dataset with root netuid 0 excluded and stores a real
-  // per-block theoretical injection value. The monitor has only just launched,
-  // so it is safer to discard earlier bootstrap rows than mix data contracts.
+  // v4 is the formula-only theory contract: real pool injection stays an observed
+  // chain value, while theoretical injection is independently calculated from
+  // RootProp × AlphaEmission × AlphaPrice. The project has only just launched,
+  // so restart the bootstrap dataset once rather than mix incompatible rows.
   await Promise.all([
     env.BLOCKS_0.prepare('DELETE FROM blocks').run(),
     env.BLOCKS_1.prepare('DELETE FROM blocks').run(),
