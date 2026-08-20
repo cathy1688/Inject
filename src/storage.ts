@@ -30,6 +30,7 @@ const ITEMS = {
   emissionGateBar: '7c9b0d2964cc73e7519676c3cc4d5df9',
   emissionGateExponent: '88c70e8dd0cf4af3aeb977ba2eee1df4',
   emissionBarQuantile: 'a772007dde2ed63e0f21b5f9d7f16650',
+  emissionBarRank: 'd33bd686290d014475513443305882be',
 
   timestampNow: '9f1f0515f462cdcf84e0f1d6045dfcbb'
 } as const;
@@ -46,7 +47,8 @@ export const globalStorageKeys = {
   taoWeight: `0x${SUBTENSOR}${ITEMS.taoWeight}`,
   emissionGateBar: `0x${SUBTENSOR}${ITEMS.emissionGateBar}`,
   emissionGateExponent: `0x${SUBTENSOR}${ITEMS.emissionGateExponent}`,
-  emissionBarQuantile: `0x${SUBTENSOR}${ITEMS.emissionBarQuantile}`
+  emissionBarQuantile: `0x${SUBTENSOR}${ITEMS.emissionBarQuantile}`,
+  emissionBarRank: `0x${SUBTENSOR}${ITEMS.emissionBarRank}`
 } as const;
 
 function u16LeHex(value: number): string {
