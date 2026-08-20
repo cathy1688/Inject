@@ -24,9 +24,8 @@ import {
 } from './db';
 
 const DEFAULT_WS = 'wss://entrypoint-finney.opentensor.ai:443';
-const DEFAULT_ARCHIVE_WS = 'wss://archive.chain.opentensor.ai:443';
 const ROOT_NETUID = 0;
-const THEORY_TIMEOUT_MS = 4_500;
+const THEORY_TIMEOUT_MS = 8_000;
 
 async function discoverCandidateNetuids(rpc: SubtensorRpc, hash: string, known: number[]): Promise<number[]> {
   const keys = await rpc.keysPaged(PREFIX.networksAdded, hash);
@@ -64,6 +63,7 @@ function rpcBigInt(value: unknown): bigint | null {
 }
 
 async function readAlphaPrices(rpc: SubtensorRpc, atHash: string): Promise<Map<number,bigint>> {
+  let decodedError: string | null = null;
   try {
     const records = await rpc.currentAlphaPricesAll(atHash);
     const prices = new Map<number,bigint>();
@@ -73,20 +73,24 @@ async function readAlphaPrices(rpc: SubtensorRpc, atHash: string): Promise<Map<n
       if (Number.isInteger(netuid) && netuid > 0 && price != null) prices.set(netuid, price);
     }
     if (prices.size > 0) return prices;
-  } catch {
-    // Fall through to raw runtime API.
+    decodedError = 'swap_currentAlphaPriceAll returned no subnet prices';
+  } catch (error) {
+    decodedError = error instanceof Error ? error.message : String(error);
   }
 
   try {
-    return decodeSubnetPrices(await rpc.currentAlphaPricesAllScale(atHash));
-  } catch {
-    return new Map();
+    const prices = decodeSubnetPrices(await rpc.currentAlphaPricesAllScale(atHash));
+    if (prices.size > 0) return prices;
+    throw new Error('runtime API returned no subnet prices');
+  } catch (error) {
+    const rawError = error instanceof Error ? error.message : String(error);
+    throw new Error(`alpha price lookup failed; decoded RPC: ${decodedError ?? 'unknown'}; runtime API: ${rawError}`);
   }
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`theory archive lookup timed out after ${ms}ms`)), ms);
+    const timer = setTimeout(() => reject(new Error(`theory lookup timed out after ${ms}ms`)), ms);
     promise.then(
       value => { clearTimeout(timer); resolve(value); },
       error => { clearTimeout(timer); reject(error); }
@@ -94,11 +98,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
   });
 }
 
-/**
- * Core collection path intentionally matches the previously stable collector:
- * only read finalized current-block state needed for actual injection and Chain Buy.
- * No historical/archive dependency is allowed to block this path.
- */
+/** Core collection path: only finalized on-chain values required for the monitor. */
 async function readBlockState(
   rpc: SubtensorRpc,
   hash: string,
@@ -127,34 +127,38 @@ async function readBlockState(
 }
 
 /**
- * Best-effort theory enrichment. Bittensor's normal finney endpoint may prune
- * historical state, so N-1 RootProp/price reads go to the official archive node.
- * Any timeout, RPC rejection, missing state or price leaves theory as null and
- * never affects the real on-chain collector.
+ * Best-effort theory enrichment.
+ * N-1 is only one block behind the finalized block, so use the same verified Finney RPC
+ * instead of a separate archive endpoint. Theory failures never block real chain data.
  */
 async function tryEnrichTheoryForBlock(
-  archiveRpc: SubtensorRpc,
+  env: Env,
+  rpc: SubtensorRpc,
   hash: string,
   parentHash: string,
   blockNumber: number,
   payload: BlockPayload,
   active: number[]
-): Promise<boolean> {
-  if (!active.length) return false;
+): Promise<number> {
+  if (!active.length) return 0;
 
   try {
     const alphaKeys = active.map(storageKeys.alphaOutEmission);
     const rootKeys = active.map(storageKeys.rootProp);
     const [alphaState, parentRootState, prices] = await withTimeout(
       Promise.all([
-        archiveRpc.queryStorage(alphaKeys, hash),
-        archiveRpc.queryStorage(rootKeys, parentHash),
-        readAlphaPrices(archiveRpc, parentHash)
+        rpc.queryStorage(alphaKeys, hash),
+        rpc.queryStorage(rootKeys, parentHash),
+        readAlphaPrices(rpc, parentHash)
       ]),
       THEORY_TIMEOUT_MS
     );
 
-    let changed = false;
+    let changed = 0;
+    let missingAlpha = 0;
+    let missingRoot = 0;
+    let missingPrice = 0;
+
     for (const netuid of active) {
       const value = payload[String(netuid)];
       if (!value) continue;
@@ -162,7 +166,9 @@ async function tryEnrichTheoryForBlock(
       const alphaHex = alphaState.get(storageKeys.alphaOutEmission(netuid)) ?? null;
       const rootHex = parentRootState.get(storageKeys.rootProp(netuid)) ?? null;
       const priceRaoPerAlpha = prices.get(netuid);
-      if (!alphaHex || !rootHex || priceRaoPerAlpha == null || priceRaoPerAlpha <= 0n) continue;
+      if (!alphaHex) { missingAlpha++; continue; }
+      if (!rootHex) { missingRoot++; continue; }
+      if (priceRaoPerAlpha == null || priceRaoPerAlpha <= 0n) { missingPrice++; continue; }
 
       const alphaEmissionRao = decodeU64(alphaHex);
       const rootProportionRaw = decodeU96F32Raw(rootHex);
@@ -178,11 +184,27 @@ async function tryEnrichTheoryForBlock(
         priceRaoPerAlpha
       });
       value[2] = theory.toString();
-      changed = true;
+      changed++;
+    }
+
+    await setState(env.META_DB, 'theory_status', changed > 0 ? 'ok' : 'empty');
+    await setState(env.META_DB, 'theory_last_block', String(blockNumber));
+    await setState(env.META_DB, 'theory_last_enriched', String(changed));
+    await setState(env.META_DB, 'theory_last_missing_alpha', String(missingAlpha));
+    await setState(env.META_DB, 'theory_last_missing_root', String(missingRoot));
+    await setState(env.META_DB, 'theory_last_missing_price', String(missingPrice));
+    if (changed > 0) {
+      await env.META_DB.prepare("DELETE FROM sync_state WHERE key='theory_last_error'").run();
+    } else {
+      await setState(env.META_DB, 'theory_last_error', `No theory rows produced: active=${active.length}, missingAlpha=${missingAlpha}, missingRoot=${missingRoot}, missingPrice=${missingPrice}`);
     }
     return changed;
-  } catch {
-    return false;
+  } catch (error) {
+    await setState(env.META_DB, 'theory_status', 'error');
+    await setState(env.META_DB, 'theory_last_block', String(blockNumber));
+    await setState(env.META_DB, 'theory_last_enriched', '0');
+    await setState(env.META_DB, 'theory_last_error', error instanceof Error ? error.message : String(error));
+    return 0;
   }
 }
 
@@ -235,7 +257,6 @@ export interface ScanResult {
 
 export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanResult> {
   const rpc = new SubtensorRpc(env.SUBTENSOR_WS_URL || DEFAULT_WS);
-  const archiveRpc = new SubtensorRpc(DEFAULT_ARCHIVE_WS);
   try {
     await rpc.connect();
     const finalizedHash = await rpc.finalizedHead();
@@ -243,14 +264,21 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
     const finalizedBlock = parseBlockNumber(finalizedHeader.number);
 
     const saved = Number(await getState(env.META_DB, 'last_finalized_block') ?? '0');
-    let start = saved > 0 ? saved + 1 : finalizedBlock;
+    const theoryLast = Number(await getState(env.META_DB, 'theory_last_block') ?? '0');
+
+    let start: number;
+    if (saved > 0 && theoryLast === 0) {
+      // One-time backfill after enabling theory: revisit the most recent batch already stored.
+      start = Math.max(1, Math.min(saved, finalizedBlock) - Math.max(1, maxBlocks) + 1);
+    } else {
+      start = saved > 0 ? saved + 1 : finalizedBlock;
+    }
     start = Math.max(start, finalizedBlock - Math.max(1, maxBlocks) + 1);
+    if (start > finalizedBlock) start = finalizedBlock;
 
     const known = await listKnownNetuids(env.META_DB);
     const candidates = await discoverCandidateNetuids(rpc, finalizedHash, known);
 
-    // Sync the current subnet directory before any historical/theory work.
-    // This guarantees the UI can recover even if later archival enrichment fails.
     const latestActive = await readActiveNetuids(rpc, finalizedHash, candidates);
     const registry = await syncRegistry(env, rpc, finalizedHash, finalizedBlock, candidates, latestActive);
 
@@ -265,14 +293,11 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
       const state = await readBlockState(rpc, hash, block, candidates);
       if (await storeBlock(env, block, hash, state.timestampMs, state.payload)) stored++;
 
-      // Advance the durable cursor immediately after the real on-chain block is stored.
       await setState(env.META_DB, 'last_finalized_block', String(block));
       await setState(env.META_DB, 'last_sync_ms', String(Date.now()));
 
-      // Theory is an optional enrichment layer and cannot roll back the core write.
-      if (await tryEnrichTheoryForBlock(archiveRpc, hash, parentHash, block, state.payload, state.active)) {
-        await updateBlockPayload(env, block, state.timestampMs, state.payload);
-      }
+      const enriched = await tryEnrichTheoryForBlock(env, rpc, hash, parentHash, block, state.payload, state.active);
+      if (enriched > 0) await updateBlockPayload(env, block, state.timestampMs, state.payload);
       parentHash = hash;
     }
 
@@ -296,6 +321,5 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
     throw error;
   } finally {
     rpc.close();
-    archiveRpc.close();
   }
 }
