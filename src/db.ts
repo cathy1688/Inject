@@ -26,10 +26,12 @@ export async function getState(db: D1Database, key: string): Promise<string | nu
   return row?.value ?? null;
 }
 
+/** No-op state writes are skipped so 12-second live polling stays inside D1 Free write limits. */
 export async function setState(db: D1Database, key: string, value: string): Promise<void> {
   await db.prepare(`
     INSERT INTO sync_state(key,value,updated_at_ms) VALUES(?,?,?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at_ms=excluded.updated_at_ms
+    WHERE sync_state.value <> excluded.value
   `).bind(key, value, Date.now()).run();
 }
 
@@ -38,6 +40,7 @@ export async function listKnownNetuids(db: D1Database): Promise<number[]> {
   return result.results.map(r => Number(r.netuid));
 }
 
+/** Only real registry changes produce D1 writes; unchanged 128-subnet snapshots are ignored. */
 export async function upsertSubnets(db: D1Database, rows: SubnetRecord[]): Promise<void> {
   if (!rows.length) return;
   const statements = rows.map(row => db.prepare(`
@@ -49,6 +52,9 @@ export async function upsertSubnets(db: D1Database, rows: SubnetRecord[]): Promi
       status=excluded.status,
       last_seen_block=excluded.last_seen_block,
       updated_at_ms=excluded.updated_at_ms
+    WHERE subnets.registration_counter IS NOT excluded.registration_counter
+       OR subnets.name <> excluded.name
+       OR subnets.status <> excluded.status
   `).bind(row.netuid, row.registration_counter, row.name, row.status, row.first_seen_block, row.last_seen_block, row.updated_at_ms));
   for (let i = 0; i < statements.length; i += 64) await db.batch(statements.slice(i, i + 64));
 }
@@ -63,14 +69,12 @@ export async function storeBlock(env: Env, blockNumber: number, blockHash: strin
   return changes > 0;
 }
 
-/** Replace only the compact payload after a best-effort theory calculation. */
 export async function updateBlockPayload(env: Env, blockNumber: number, timestampMs: number, payload: BlockPayload): Promise<void> {
   const db = blockDbForTimestamp(env, timestampMs);
   await db.prepare('UPDATE blocks SET payload = ? WHERE block_number = ?')
     .bind(JSON.stringify(payload), blockNumber).run();
 }
 
-/** Earliest retained raw block across the four rolling D1 shards. */
 export async function getEarliestStoredBlockNumber(env: Env): Promise<number | null> {
   let earliest: number | null = null;
   for (const db of blockDatabases(env)) {
@@ -82,10 +86,6 @@ export async function getEarliestStoredBlockNumber(env: Env): Promise<number | n
   return earliest;
 }
 
-/**
- * Return the next retained raw blocks after a cursor, globally ordered across
- * all rolling shards. Used by the incremental theoretical-value backfill.
- */
 export async function getStoredBlocksAfter(env: Env, afterBlock: number, limit: number): Promise<StoredBlockRow[]> {
   const safeLimit = Math.max(1, Math.min(64, Math.trunc(limit)));
   const merged: StoredBlockRow[] = [];
@@ -104,7 +104,6 @@ export async function getStoredBlocksAfter(env: Env, afterBlock: number, limit: 
       payload: String(row.payload)
     })));
   }
-
   merged.sort((a, b) => a.block_number - b.block_number);
   const unique: StoredBlockRow[] = [];
   let previous = -1;
@@ -159,7 +158,6 @@ export async function rebuildHourlySummary(env: Env, periodStartMs: number): Pro
   `).bind(periodStartMs, JSON.stringify(summary), blocks, Date.now()).run();
 }
 
-/** Build every closed hour exactly once; retries are idempotent because rows are replaced. */
 export async function ensureClosedHourlySummaries(env: Env, latestTimestampMs: number): Promise<void> {
   const currentHour = Math.floor(latestTimestampMs / HOUR_MS) * HOUR_MS;
   const state = await getState(env.META_DB, 'next_hourly_summary_ms');
