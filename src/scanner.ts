@@ -43,11 +43,10 @@ const DEFAULT_WS = 'wss://entrypoint-finney.opentensor.ai:443';
 const ROOT_NETUID = 0;
 const THEORY_BACKFILL_BATCH = 4;
 
-type BlockState = {
+type CoreBlockState = {
   timestampMs: number;
   payload: BlockPayload;
   active: number[];
-  nextFormula: TheorySnapshot;
 };
 
 type TheoryStats = {
@@ -183,7 +182,6 @@ function decodeFormulaSnapshot(
   };
 }
 
-/** End-state of block N is the complete pre-coinbase state for block N+1. */
 async function readFormulaSnapshot(rpc: SubtensorRpc, hash: string, candidates: number[]): Promise<TheorySnapshot> {
   const [state, prices] = await Promise.all([
     rpc.queryStorage(formulaStorageKeys(candidates), hash),
@@ -192,35 +190,26 @@ async function readFormulaSnapshot(rpc: SubtensorRpc, hash: string, candidates: 
   return decodeFormulaSnapshot(state, candidates, prices);
 }
 
-/**
- * Read observed outputs and, in the same storage pass, all independent formula
- * state needed by the next block. Actual injection/Chain Buy are never fed back
- * into the theory engine.
- */
-async function readBlockState(rpc: SubtensorRpc, hash: string, blockNumber: number, candidates: number[]): Promise<BlockState> {
-  const keys = new Set<string>([TIMESTAMP_NOW_KEY, ...formulaStorageKeys(candidates)]);
+/** Critical-path read: only observed chain outputs and active flags. */
+async function readCoreBlockState(rpc: SubtensorRpc, hash: string, blockNumber: number, candidates: number[]): Promise<CoreBlockState> {
+  const keys: string[] = [TIMESTAMP_NOW_KEY];
   for (const netuid of candidates) {
-    keys.add(storageKeys.taoInEmission(netuid));
-    keys.add(storageKeys.excessTao(netuid));
+    keys.push(storageKeys.networksAdded(netuid), storageKeys.taoInEmission(netuid), storageKeys.excessTao(netuid));
   }
-  const [state, prices] = await Promise.all([
-    rpc.queryStorage([...keys], hash),
-    readAlphaPrices(rpc, hash)
-  ]);
+  const state = await rpc.queryStorage(keys, hash);
   const timestampMs = Number(decodeU64(state.get(TIMESTAMP_NOW_KEY) ?? null));
   if (!Number.isSafeInteger(timestampMs) || timestampMs <= 0) throw new Error(`Invalid Timestamp.Now at block ${blockNumber}`);
 
-  const nextFormula = decodeFormulaSnapshot(state, candidates, prices);
   const payload: BlockPayload = {};
   const active: number[] = [];
-  for (const subnet of nextFormula.subnets) {
-    if (!subnet.networkAdded) continue;
-    active.push(subnet.netuid);
-    const actual = decodeU64(state.get(storageKeys.taoInEmission(subnet.netuid)) ?? null);
-    const chainBuy = decodeU64(state.get(storageKeys.excessTao(subnet.netuid)) ?? null);
-    payload[String(subnet.netuid)] = [actual.toString(), chainBuy.toString(), null];
+  for (const netuid of candidates) {
+    if (!decodeBool(state.get(storageKeys.networksAdded(netuid)) ?? null)) continue;
+    active.push(netuid);
+    const actual = decodeU64(state.get(storageKeys.taoInEmission(netuid)) ?? null);
+    const chainBuy = decodeU64(state.get(storageKeys.excessTao(netuid)) ?? null);
+    payload[String(netuid)] = [actual.toString(), chainBuy.toString(), null];
   }
-  return { timestampMs, payload, active, nextFormula };
+  return { timestampMs, payload, active };
 }
 
 function applyTheory(payload: BlockPayload, active: number[], previous: TheorySnapshot, blockNumber: number): TheoryStats {
@@ -276,7 +265,6 @@ async function syncRegistry(env: Env, rpc: SubtensorRpc, hash: string, blockNumb
   return { added, removed };
 }
 
-/** Recalculate retained old rows with the versioned independent theory model. */
 async function backfillTheory(env: Env, rpc: SubtensorRpc, batchSize = THEORY_BACKFILL_BATCH): Promise<void> {
   const formulaVersion = await getState(env.META_DB, 'theory_formula_version');
   let cursorState = await getState(env.META_DB, 'theory_backfill_cursor');
@@ -343,6 +331,26 @@ async function backfillTheory(env: Env, rpc: SubtensorRpc, batchSize = THEORY_BA
   }
 }
 
+/** Background-only historical theory enrichment; never blocks live collection. */
+export async function runTheoryBackfill(env: Env, batchSize = THEORY_BACKFILL_BATCH): Promise<void> {
+  const now = Date.now();
+  const lockUntil = Number(await getState(env.META_DB, 'theory_backfill_lock_until_ms') ?? '0');
+  if (lockUntil > now) return;
+  await setState(env.META_DB, 'theory_backfill_lock_until_ms', String(now + 30_000));
+  const rpc = new SubtensorRpc(env.SUBTENSOR_WS_URL || DEFAULT_WS);
+  try {
+    await rpc.connect();
+    await backfillTheory(env, rpc, Math.max(1, Math.min(12, Math.trunc(batchSize))));
+    await env.META_DB.prepare("DELETE FROM sync_state WHERE key='theory_backfill_error'").run();
+  } catch (error) {
+    await setState(env.META_DB, 'theory_backfill_status', 'error');
+    await setState(env.META_DB, 'theory_backfill_error', error instanceof Error ? error.message : String(error));
+  } finally {
+    await setState(env.META_DB, 'theory_backfill_lock_until_ms', '0');
+    rpc.close();
+  }
+}
+
 export interface ScanResult { finalizedBlock:number; scanned:number; stored:number; activeSubnets:number; addedSubnets:number; removedSubnets:number; }
 
 export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanResult> {
@@ -358,8 +366,6 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
 
     const formulaVersionBefore = await getState(env.META_DB, 'theory_formula_version');
     if (formulaVersionBefore !== THEORY_MODEL_VERSION) {
-      // Blocks at/after this cursor are generated by the new model even while
-      // older retained rows are being backfilled from the beginning.
       await setState(env.META_DB, 'theory_live_start_block', String(start));
     }
 
@@ -369,37 +375,45 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
     const registry = await syncRegistry(env, rpc, finalizedHash, finalizedBlock, candidates, latestActive);
 
     let stored = 0;
-    let lastTheory = emptyTheoryStats();
-    if (start <= end) {
-      const parentHash = start === finalizedBlock ? finalizedHeader.parentHash : await rpc.blockHash(start - 1);
-      if (!parentHash) throw new Error(`Missing parent block hash for ${start}`);
-      let previousFormula = await readFormulaSnapshot(rpc, parentHash, candidates);
-      for (let block = start; block <= end; block++) {
-        const hash = block === finalizedBlock ? finalizedHash : await rpc.blockHash(block);
-        if (!hash) throw new Error(`Missing block hash for ${block}`);
-        const state = await readBlockState(rpc, hash, block, candidates);
-        lastTheory = applyTheory(state.payload, state.active, previousFormula, block);
-        if (await storeBlock(env, block, hash, state.timestampMs, state.payload)) stored++;
-        else if (lastTheory.enriched > 0) await updateBlockPayload(env, block, state.timestampMs, state.payload);
-        await setState(env.META_DB, 'last_finalized_block', String(block));
-        await setState(env.META_DB, 'last_sync_ms', String(Date.now()));
-        if (lastTheory.enriched > 0) await setState(env.META_DB, 'theory_last_block', String(block));
-        previousFormula = state.nextFormula;
+    let parentHash = start === finalizedBlock ? finalizedHeader.parentHash : (start <= end ? await rpc.blockHash(start - 1) : null);
+
+    for (let block = start; block <= end; block++) {
+      const hash = block === finalizedBlock ? finalizedHash : await rpc.blockHash(block);
+      if (!hash) throw new Error(`Missing block hash for ${block}`);
+      if (!parentHash) {
+        const header = await rpc.header(hash);
+        parentHash = header.parentHash;
       }
 
-      await setState(env.META_DB, 'theory_status', lastTheory.enriched > 0 ? 'ok' : 'partial');
-      await setState(env.META_DB, 'theory_last_enriched', String(lastTheory.enriched));
-      await setState(env.META_DB, 'theory_last_missing_root', String(lastTheory.missingRoot));
-      await setState(env.META_DB, 'theory_last_missing_alpha', String(lastTheory.missingAlpha));
-      await setState(env.META_DB, 'theory_last_missing_price', String(lastTheory.missingPrice));
-      await setState(env.META_DB, 'theory_last_equal_actual', String(lastTheory.equalActual));
-      await setState(env.META_DB, 'theory_last_different_actual', String(lastTheory.differentActual));
-    }
+      // 1. Critical path: store observed outputs first and advance the cursor.
+      const state = await readCoreBlockState(rpc, hash, block, candidates);
+      const inserted = await storeBlock(env, block, hash, state.timestampMs, state.payload);
+      if (inserted) stored++;
+      await setState(env.META_DB, 'last_finalized_block', String(block));
+      await setState(env.META_DB, 'last_sync_ms', String(Date.now()));
 
-    try { await backfillTheory(env, rpc); }
-    catch (error) {
-      await setState(env.META_DB, 'theory_backfill_status', 'error');
-      await setState(env.META_DB, 'theory_backfill_error', error instanceof Error ? error.message : String(error));
+      // 2. Best-effort independent reconstruction. Failure cannot roll back step 1.
+      try {
+        const previousFormula = await readFormulaSnapshot(rpc, parentHash, candidates);
+        const stats = applyTheory(state.payload, state.active, previousFormula, block);
+        if (stats.enriched > 0) {
+          await updateBlockPayload(env, block, state.timestampMs, state.payload);
+          await setState(env.META_DB, 'theory_last_block', String(block));
+        }
+        await setState(env.META_DB, 'theory_status', stats.enriched > 0 ? 'ok' : 'partial');
+        await setState(env.META_DB, 'theory_last_enriched', String(stats.enriched));
+        await setState(env.META_DB, 'theory_last_missing_root', String(stats.missingRoot));
+        await setState(env.META_DB, 'theory_last_missing_alpha', String(stats.missingAlpha));
+        await setState(env.META_DB, 'theory_last_missing_price', String(stats.missingPrice));
+        await setState(env.META_DB, 'theory_last_equal_actual', String(stats.equalActual));
+        await setState(env.META_DB, 'theory_last_different_actual', String(stats.differentActual));
+        await env.META_DB.prepare("DELETE FROM sync_state WHERE key='theory_last_error'").run();
+      } catch (error) {
+        await setState(env.META_DB, 'theory_status', 'partial');
+        await setState(env.META_DB, 'theory_last_error', error instanceof Error ? error.message : String(error));
+      }
+
+      parentHash = hash;
     }
 
     const latestTimestampMs = Number(decodeU64((await rpc.queryStorage([TIMESTAMP_NOW_KEY], finalizedHash)).get(TIMESTAMP_NOW_KEY) ?? null));
