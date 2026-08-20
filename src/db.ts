@@ -4,6 +4,13 @@ export const HOUR_MS = 3_600_000;
 export const DAY_MS = 86_400_000;
 const SHARD_WINDOW_MS = 8 * DAY_MS;
 
+export interface StoredBlockRow {
+  block_number: number;
+  block_hash: string;
+  timestamp_ms: number;
+  payload: string;
+}
+
 export function blockDatabases(env: Env): D1Database[] {
   return [env.BLOCKS_0, env.BLOCKS_1, env.BLOCKS_2, env.BLOCKS_3];
 }
@@ -61,6 +68,53 @@ export async function updateBlockPayload(env: Env, blockNumber: number, timestam
   const db = blockDbForTimestamp(env, timestampMs);
   await db.prepare('UPDATE blocks SET payload = ? WHERE block_number = ?')
     .bind(JSON.stringify(payload), blockNumber).run();
+}
+
+/** Earliest retained raw block across the four rolling D1 shards. */
+export async function getEarliestStoredBlockNumber(env: Env): Promise<number | null> {
+  let earliest: number | null = null;
+  for (const db of blockDatabases(env)) {
+    const row = await db.prepare('SELECT MIN(block_number) AS n FROM blocks').first<{ n: number | null }>();
+    if (row?.n == null) continue;
+    const value = Number(row.n);
+    if (Number.isSafeInteger(value) && (earliest == null || value < earliest)) earliest = value;
+  }
+  return earliest;
+}
+
+/**
+ * Return the next retained raw blocks after a cursor, globally ordered across
+ * all rolling shards. Used by the incremental theoretical-value backfill.
+ */
+export async function getStoredBlocksAfter(env: Env, afterBlock: number, limit: number): Promise<StoredBlockRow[]> {
+  const safeLimit = Math.max(1, Math.min(64, Math.trunc(limit)));
+  const merged: StoredBlockRow[] = [];
+  for (const db of blockDatabases(env)) {
+    const result = await db.prepare(`
+      SELECT block_number, block_hash, timestamp_ms, payload
+      FROM blocks
+      WHERE block_number > ?
+      ORDER BY block_number ASC
+      LIMIT ?
+    `).bind(afterBlock, safeLimit).all<StoredBlockRow>();
+    merged.push(...result.results.map(row => ({
+      block_number: Number(row.block_number),
+      block_hash: String(row.block_hash),
+      timestamp_ms: Number(row.timestamp_ms),
+      payload: String(row.payload)
+    })));
+  }
+
+  merged.sort((a, b) => a.block_number - b.block_number);
+  const unique: StoredBlockRow[] = [];
+  let previous = -1;
+  for (const row of merged) {
+    if (row.block_number === previous) continue;
+    unique.push(row);
+    previous = row.block_number;
+    if (unique.length >= safeLimit) break;
+  }
+  return unique;
 }
 
 function emptySummary(value: [string,string,string|null]): SubnetSummaryValue {
