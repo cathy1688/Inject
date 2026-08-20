@@ -8,7 +8,7 @@
  *   global block emission(total issuance)
  *     -> EMA-price subnet shares
  *     -> miner-burn weighting
- *     -> emission gate
+ *     -> emission gate (rank mode first, q-mass mode when rank=0)
  *     -> emission-enabled redistribution
  *     -> nominal subnet TAO emission
  *
@@ -28,6 +28,7 @@ const TOTAL_SUPPLY_RAO = 21_000_000_000_000_000n;
 const DEFAULT_BLOCK_EMISSION_RAO = 1_000_000_000n;
 const PRICE_SCALE = 1_000_000_000n;
 
+export const DEFAULT_GATE_RANK = 32;
 export const DEFAULT_GATE_EXPONENT_RAW = 3n * FIXED_64;
 export const DEFAULT_GATE_QUANTILE_RAW = (61n * FIXED_64) / 100n;
 
@@ -53,6 +54,7 @@ export interface TheorySnapshot {
   emissionGateBarRaw: bigint; // U64F64
   emissionGateExponentRaw: bigint; // U64F64
   emissionBarQuantileRaw: bigint; // U64F64
+  emissionBarRank: number; // u16; rank mode when > 0
   subnets: TheorySubnetState[];
 }
 
@@ -141,7 +143,7 @@ function eligible(subnet: TheorySubnetState): boolean {
 
 function normalizedPriceShares(subnets: TheorySubnetState[]): Map<number, number> {
   const prices = subnets.map(subnet => {
-    // get_moving_alpha_price() returns exactly 1 for stable mechanism 0.
+    // Runtime `get_moving_alpha_price`: stable mechanism 0 has price 1.
     const price = subnet.mechanism === 0 ? 1 : Math.max(0, fixed32ToNumber(subnet.movingPriceRaw));
     return [subnet.netuid, Number.isFinite(price) ? price : 0] as const;
   });
@@ -159,29 +161,32 @@ function minerBurnWeightedShares(subnets: TheorySubnetState[], priceShares: Map<
   return new Map(weighted.map(([netuid, value]) => [netuid, value / total]));
 }
 
-function qMassBar(shares: Map<number, number>, quantile: number): number {
-  const sorted = [...shares.values()].sort((a, b) => b - a);
+/** Mirror `maybe_update_emission_gate_bar`: rank mode wins when rank > 0. */
+function selectGateBar(shares: Map<number, number>, rank: number, quantile: number): number {
+  const positive = [...shares.values()].filter(value => value > 0).sort((a, b) => b - a);
+  if (!positive.length) return 0;
+  if (rank > 0) return positive[Math.min(rank, positive.length) - 1];
+
   let cumulative = 0;
-  let theta = 0;
-  for (const share of sorted) {
+  for (const share of positive) {
     cumulative += share;
-    theta = share;
-    if (cumulative >= quantile) break;
+    if (cumulative >= quantile) return share;
   }
-  return theta;
+  return positive[positive.length - 1];
 }
 
 function gatedShares(
   weighted: Map<number, number>,
   blockNumber: number,
   storedBar: number,
+  rank: number,
   quantile: number,
   exponent: number
 ): Map<number, number> {
   // Runtime refreshes theta every 360 blocks, or whenever the stored bar is zero.
   const theta = storedBar > 0 && blockNumber % 360 !== 0
     ? storedBar
-    : qMassBar(weighted, quantile);
+    : selectGateBar(weighted, rank, quantile);
   if (!(theta > 0)) return new Map(weighted);
 
   const gated = new Map<number, number>();
@@ -232,7 +237,10 @@ export function calculateIndependentTheory(snapshot: TheorySnapshot, blockNumber
   const quantileRaw = snapshot.emissionBarQuantileRaw > 0n ? snapshot.emissionBarQuantileRaw : DEFAULT_GATE_QUANTILE_RAW;
   const exponent = Math.max(0, fixed64ToNumber(exponentRaw));
   const quantile = Math.min(1, Math.max(0, fixed64ToNumber(quantileRaw)));
-  const afterGate = gatedShares(weightedShares, blockNumber, bar, quantile, exponent);
+  const rank = Number.isInteger(snapshot.emissionBarRank) && snapshot.emissionBarRank >= 0
+    ? snapshot.emissionBarRank
+    : DEFAULT_GATE_RANK;
+  const afterGate = gatedShares(weightedShares, blockNumber, bar, rank, quantile, exponent);
   const effectiveShares = redistributeDisabled(emitting, afterGate);
   const globalBlockEmissionRao = blockEmissionForIssuanceRao(snapshot.totalIssuanceRao);
 
