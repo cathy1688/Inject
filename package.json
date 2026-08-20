@@ -6,13 +6,10 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit",
-    "db:migrate:local": "wrangler d1 migrations apply inject-db --local",
-    "db:migrate:remote": "wrangler d1 migrations apply inject-db --remote"
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^4.20260820.0",
     "typescript": "^5.9.2",
-    "wrangler": "^4.32.0"
+    "wrangler": "^4.123.0"
   }
 }
