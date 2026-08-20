@@ -59,14 +59,14 @@ async function status(env: Env): Promise<Response> {
   const db=env.META_DB;
   const keys = [
     'last_finalized_block','chain_finalized_block','last_sync_ms','rpc_status','last_error',
-    'registry_added_last','registry_removed_last','theory_status','theory_last_block','theory_last_enriched',
+    'registry_added_last','registry_removed_last','theory_status','theory_last_error','theory_last_block','theory_last_enriched',
     'theory_last_missing_root','theory_last_missing_alpha','theory_last_missing_price',
     'theory_last_equal_actual','theory_last_different_actual','theory_formula_version','theory_live_start_block',
     'theory_backfill_status','theory_backfill_cursor','theory_backfill_last_processed','theory_backfill_error'
   ];
   const values = await Promise.all(keys.map(key => getState(db,key)));
   const [
-    last,chain,syncMs,rpcStatus,error,added,removed,theoryStatus,theoryBlock,theoryEnriched,
+    last,chain,syncMs,rpcStatus,error,added,removed,theoryStatus,theoryLastError,theoryBlock,theoryEnriched,
     missingRoot,missingAlpha,missingPrice,equalActual,differentActual,formulaVersion,liveStart,
     backfillStatus,backfillCursor,backfillProcessed,backfillError
   ]=values;
@@ -87,6 +87,7 @@ async function status(env: Env): Promise<Response> {
     theoryFormulaVersion: formulaVersion ?? null,
     theoryVersionMatches: versionMatches,
     theoryStatus: theoryStatus ?? 'waiting',
+    theoryLastError: theoryLastError ?? null,
     theoryLastBlock: Number(theoryBlock ?? 0),
     theoryLastEnriched: Number(theoryEnriched ?? 0),
     theoryMissingRoot: Number(missingRoot ?? 0),
@@ -135,8 +136,6 @@ async function subnetsSummary(req: Request, env: Env): Promise<Response> {
   if (from > to) return bad('from must be <= to');
   const [summary,validity]=await Promise.all([aggregateRange(env,from,to),theoryValidity(env)]);
   const subnetRows = await env.META_DB.prepare('SELECT netuid,name,status FROM subnets WHERE netuid > 0 ORDER BY netuid').all<{netuid:number;name:string;status:string}>();
-  // Hourly summaries created by the prior circular model are intentionally not
-  // exposed while V7 is backfilling. Actual and Chain Buy data remain visible.
   const exposeTheory=validity.complete;
   const items=subnetRows.results.map(meta=>{
     const v=summary[String(meta.netuid)] ?? ['0','0',null,0];
