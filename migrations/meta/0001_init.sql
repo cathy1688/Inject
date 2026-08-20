@@ -11,19 +11,7 @@ CREATE TABLE IF NOT EXISTS subnets (
 );
 CREATE INDEX IF NOT EXISTS idx_subnets_status ON subnets(status);
 
-CREATE TABLE IF NOT EXISTS minute_summary (
-  period_start_ms INTEGER PRIMARY KEY,
-  payload TEXT NOT NULL,
-  block_count INTEGER NOT NULL DEFAULT 0,
-  updated_at_ms INTEGER NOT NULL
-);
 CREATE TABLE IF NOT EXISTS hourly_summary (
-  period_start_ms INTEGER PRIMARY KEY,
-  payload TEXT NOT NULL,
-  block_count INTEGER NOT NULL DEFAULT 0,
-  updated_at_ms INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS daily_summary (
   period_start_ms INTEGER PRIMARY KEY,
   payload TEXT NOT NULL,
   block_count INTEGER NOT NULL DEFAULT 0,
