@@ -12,3 +12,15 @@ interface D1Database {
 interface Fetcher { fetch(input: Request | string, init?: RequestInit): Promise<Response>; }
 interface ExecutionContext { waitUntil(promise: Promise<unknown>): void; passThroughOnException(): void; }
 interface ScheduledController { scheduledTime: number; cron: string; noRetry(): void; }
+interface DurableObjectId {}
+interface DurableObjectStub { fetch(input: Request | string, init?: RequestInit): Promise<Response>; }
+interface DurableObjectNamespace {
+  idFromName(name: string): DurableObjectId;
+  get(id: DurableObjectId): DurableObjectStub;
+}
+interface DurableObjectStorage {
+  getAlarm(): Promise<number | null>;
+  setAlarm(scheduledTime: number | Date): Promise<void>;
+  deleteAlarm(): Promise<void>;
+}
+interface DurableObjectState { storage: DurableObjectStorage; }
