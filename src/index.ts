@@ -11,9 +11,11 @@ export default {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api/')) {
       await ensureSchema(env);
-      // API traffic is also a lightweight watchdog. This does not perform the
-      // scan inline; it only makes sure the Durable Object alarm loop is armed.
-      ctx.waitUntil(ensureCollector(env).catch(()=>undefined));
+      // Status polling is enough to prime the collector immediately after a
+      // deployment; the minute cron remains the independent watchdog.
+      if (url.pathname === '/api/status') {
+        ctx.waitUntil(ensureCollector(env).catch(()=>undefined));
+      }
       return handleApi(request, env);
     }
     return env.ASSETS.fetch(request);
