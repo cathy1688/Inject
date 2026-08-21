@@ -1,7 +1,8 @@
 import type { Env } from './types';
 import { handleApi } from './api';
+import { runArchiveTheoryBackfill } from './archive-backfill';
 import { cleanupOldData } from './db';
-import { runTheoryBackfill, scanToFinalized } from './scanner';
+import { scanToFinalized } from './scanner';
 import { ensureSchema } from './schema';
 
 export default {
@@ -9,10 +10,10 @@ export default {
     const url = new URL(request.url);
     if (url.pathname.startsWith('/api/')) {
       await ensureSchema(env);
-      // The 12-second live sync response is kept fast. Status polling advances a
-      // tiny historical theory batch in waitUntil(), after the response path.
+      // Live collection stays on the normal Finney endpoint. Historical V7
+      // reconstruction runs separately on archive RPC after the status response.
       if (request.method === 'GET' && url.pathname === '/api/status') {
-        ctx.waitUntil(runTheoryBackfill(env, 2).catch(() => undefined));
+        ctx.waitUntil(runArchiveTheoryBackfill(env, 2).catch(() => undefined));
       }
       return handleApi(request, env);
     }
@@ -23,7 +24,7 @@ export default {
     await ensureSchema(env);
     ctx.waitUntil((async () => {
       await scanToFinalized(env, 24).catch(() => undefined);
-      await runTheoryBackfill(env, 8).catch(() => undefined);
+      await runArchiveTheoryBackfill(env, 8).catch(() => undefined);
     })());
     const lastCleanup = Number((await env.META_DB.prepare("SELECT value FROM sync_state WHERE key='last_cleanup_ms'").first<{value:string}>())?.value ?? 0);
     if (Date.now() - lastCleanup > 20 * 60 * 60 * 1000) {
