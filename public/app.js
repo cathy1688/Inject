@@ -10,7 +10,7 @@ let selectedSubnet=128;
 let rows=[];
 let filteredRows=[];
 let blockSortKey='time';
-let blockSortDir='asc';
+let blockSortDir='desc';
 let loadToken=0;
 
 const list=document.getElementById('virtualList');
