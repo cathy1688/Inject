@@ -24,3 +24,11 @@ interface DurableObjectStorage {
   deleteAlarm(): Promise<void>;
 }
 interface DurableObjectState { storage: DurableObjectStorage; }
+
+declare module 'cloudflare:workers' {
+  export class DurableObject<Environment = unknown> {
+    protected readonly ctx: DurableObjectState;
+    protected readonly env: Environment;
+    constructor(ctx: DurableObjectState, env: Environment);
+  }
+}
