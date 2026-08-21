@@ -27,12 +27,8 @@ import {
 } from './theory';
 import {
   ensureClosedHourlySummaries,
-  getEarliestStoredBlockNumber,
   getState,
-  getStoredBlocksAfter,
-  HOUR_MS,
   listKnownNetuids,
-  rebuildHourlySummary,
   setState,
   storeBlock,
   updateBlockPayload,
@@ -41,7 +37,14 @@ import {
 
 const DEFAULT_WS = 'wss://entrypoint-finney.opentensor.ai:443';
 const ROOT_NETUID = 0;
-const THEORY_BACKFILL_BATCH = 4;
+
+// A normal invocation usually sees 0-1 new block. If the worker was offline for
+// hours, processing 24 historical blocks plus D1/theory work can exceed the
+// Cloudflare per-invocation subrequest limit. Catch-up therefore uses small,
+// core-only batches. Once close to the head, full independent theory resumes.
+const CATCHUP_THRESHOLD_BLOCKS = 64;
+const CATCHUP_BATCH_BLOCKS = 8;
+const LIVE_BATCH_BLOCKS = 6;
 
 type CoreBlockState = {
   timestampMs: number;
@@ -58,8 +61,24 @@ type TheoryStats = {
   differentActual: number;
 };
 
-function emptyTheoryStats(): TheoryStats {
-  return { enriched:0, missingRoot:0, missingAlpha:0, missingPrice:0, equalActual:0, differentActual:0 };
+function rpcBigInt(value: unknown): bigint | null {
+  if (typeof value === 'bigint') return value >= 0n ? value : null;
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
+  if (typeof value === 'string') {
+    if (/^\d+$/.test(value)) return BigInt(value);
+    if (/^0x[0-9a-f]+$/i.test(value)) return BigInt(value);
+  }
+  return null;
+}
+
+async function writeSyncStates(db: D1Database, values: Record<string, string>): Promise<void> {
+  const now = Date.now();
+  const statements = Object.entries(values).map(([key, value]) => db.prepare(`
+    INSERT INTO sync_state(key,value,updated_at_ms) VALUES(?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at_ms=excluded.updated_at_ms
+    WHERE sync_state.value <> excluded.value
+  `).bind(key, value, now));
+  if (statements.length) await db.batch(statements);
 }
 
 async function discoverCandidateNetuids(rpc: SubtensorRpc, hash: string, known: number[]): Promise<number[]> {
@@ -86,16 +105,6 @@ async function readActiveNetuids(rpc: SubtensorRpc, hash: string, candidates: nu
   const keys = candidates.map(storageKeys.networksAdded);
   const state = await rpc.queryStorage(keys, hash);
   return candidates.filter(netuid => decodeBool(state.get(storageKeys.networksAdded(netuid)) ?? null));
-}
-
-function rpcBigInt(value: unknown): bigint | null {
-  if (typeof value === 'bigint') return value >= 0n ? value : null;
-  if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) return BigInt(value);
-  if (typeof value === 'string') {
-    if (/^\d+$/.test(value)) return BigInt(value);
-    if (/^0x[0-9a-f]+$/i.test(value)) return BigInt(value);
-  }
-  return null;
 }
 
 async function readAlphaPrices(rpc: SubtensorRpc, atHash: string): Promise<Map<number,bigint>> {
@@ -190,7 +199,6 @@ async function readFormulaSnapshot(rpc: SubtensorRpc, hash: string, candidates: 
   return decodeFormulaSnapshot(state, candidates, prices);
 }
 
-/** Critical-path read: only observed chain outputs and active flags. */
 async function readCoreBlockState(rpc: SubtensorRpc, hash: string, blockNumber: number, candidates: number[]): Promise<CoreBlockState> {
   const keys: string[] = [TIMESTAMP_NOW_KEY];
   for (const netuid of candidates) {
@@ -252,117 +260,65 @@ async function syncRegistry(env: Env, rpc: SubtensorRpc, hash: string, blockNumb
     if (!prev && !isActive) continue;
     const counter = isActive ? decodeU64(counters.get(storageKeys.registeredSubnetCounter(netuid)) ?? null).toString() : null;
     rows.push({
-      netuid, registration_counter: counter, name: names.get(netuid) ?? prev?.name ?? `Subnet ${netuid}`,
-      status: isActive ? 'active' : 'deregistered', first_seen_block: prev?.first_seen_block ?? blockNumber,
-      last_seen_block: blockNumber, updated_at_ms: now
+      netuid,
+      registration_counter: counter,
+      name: names.get(netuid) ?? prev?.name ?? `Subnet ${netuid}`,
+      status: isActive ? 'active' : 'deregistered',
+      first_seen_block: prev?.first_seen_block ?? blockNumber,
+      last_seen_block: blockNumber,
+      updated_at_ms: now
     });
   }
   await upsertSubnets(env.META_DB, rows);
   await env.META_DB.prepare('DELETE FROM subnets WHERE netuid = 0').run();
-  await setState(env.META_DB, 'registry_added_last', String(added));
-  await setState(env.META_DB, 'registry_removed_last', String(removed));
-  await setState(env.META_DB, 'last_registry_sync_block', String(blockNumber));
+  await writeSyncStates(env.META_DB, {
+    registry_added_last: String(added),
+    registry_removed_last: String(removed),
+    last_registry_sync_block: String(blockNumber)
+  });
   return { added, removed };
 }
 
-async function backfillTheory(env: Env, rpc: SubtensorRpc, batchSize = THEORY_BACKFILL_BATCH): Promise<void> {
-  const formulaVersion = await getState(env.META_DB, 'theory_formula_version');
-  let cursorState = await getState(env.META_DB, 'theory_backfill_cursor');
-  if (formulaVersion !== THEORY_MODEL_VERSION) {
-    const earliest = await getEarliestStoredBlockNumber(env);
-    await setState(env.META_DB, 'theory_formula_version', THEORY_MODEL_VERSION);
-    await env.META_DB.prepare("DELETE FROM sync_state WHERE key IN ('theory_backfill_error','theory_backfill_missing_root','theory_backfill_missing_alpha','theory_backfill_missing_price')").run();
-    if (earliest == null) {
-      await setState(env.META_DB, 'theory_backfill_status', 'complete');
-      return;
-    }
-    cursorState = String(earliest - 1);
-    await setState(env.META_DB, 'theory_backfill_cursor', cursorState);
-    await setState(env.META_DB, 'theory_backfill_status', 'running');
-  } else if (cursorState == null) {
-    const earliest = await getEarliestStoredBlockNumber(env);
-    cursorState = String((earliest ?? 1) - 1);
-    await setState(env.META_DB, 'theory_backfill_cursor', cursorState);
-  }
-
-  let cursor = Number(cursorState);
-  const rows = await getStoredBlocksAfter(env, cursor, batchSize);
-  if (!rows.length) {
-    await setState(env.META_DB, 'theory_backfill_status', 'complete');
-    await setState(env.META_DB, 'theory_backfill_last_processed', '0');
-    return;
-  }
-
-  let processed = 0;
-  const touchedHours = new Set<number>();
-  for (const row of rows) {
-    const payload = JSON.parse(row.payload) as BlockPayload;
-    const candidates = Object.keys(payload).map(Number).filter(n => Number.isInteger(n) && n > 0);
-    if (!candidates.length) {
-      cursor = row.block_number;
-      processed++;
-      await setState(env.META_DB, 'theory_backfill_cursor', String(cursor));
-      continue;
-    }
-
-    const header = await rpc.header(row.block_hash);
-    const previousFormula = await readFormulaSnapshot(rpc, header.parentHash, candidates);
-    const stats = applyTheory(payload, candidates, previousFormula, row.block_number);
-    await setState(env.META_DB, 'theory_backfill_missing_root', String(stats.missingRoot));
-    await setState(env.META_DB, 'theory_backfill_missing_alpha', String(stats.missingAlpha));
-    await setState(env.META_DB, 'theory_backfill_missing_price', String(stats.missingPrice));
-    if (stats.enriched !== candidates.length) {
-      await setState(env.META_DB, 'theory_backfill_status', 'partial');
-      break;
-    }
-
-    await updateBlockPayload(env, row.block_number, row.timestamp_ms, payload);
-    touchedHours.add(Math.floor(row.timestamp_ms / HOUR_MS) * HOUR_MS);
-    cursor = row.block_number;
-    processed++;
-    await setState(env.META_DB, 'theory_backfill_cursor', String(cursor));
-  }
-
-  for (const hour of touchedHours) await rebuildHourlySummary(env, hour);
-  await setState(env.META_DB, 'theory_backfill_last_processed', String(processed));
-  if (processed === rows.length) {
-    const more = await getStoredBlocksAfter(env, cursor, 1);
-    await setState(env.META_DB, 'theory_backfill_status', more.length ? 'running' : 'complete');
-  }
+export interface ScanResult {
+  finalizedBlock: number;
+  processedThroughBlock: number;
+  remainingLag: number;
+  syncMode: 'live' | 'catchup';
+  scanned: number;
+  stored: number;
+  activeSubnets: number;
+  addedSubnets: number;
+  removedSubnets: number;
 }
-
-/** Background-only historical theory enrichment; never blocks live collection. */
-export async function runTheoryBackfill(env: Env, batchSize = THEORY_BACKFILL_BATCH): Promise<void> {
-  const now = Date.now();
-  const lockUntil = Number(await getState(env.META_DB, 'theory_backfill_lock_until_ms') ?? '0');
-  if (lockUntil > now) return;
-  await setState(env.META_DB, 'theory_backfill_lock_until_ms', String(now + 30_000));
-  const rpc = new SubtensorRpc(env.SUBTENSOR_WS_URL || DEFAULT_WS);
-  try {
-    await rpc.connect();
-    await backfillTheory(env, rpc, Math.max(1, Math.min(12, Math.trunc(batchSize))));
-    await env.META_DB.prepare("DELETE FROM sync_state WHERE key='theory_backfill_error'").run();
-  } catch (error) {
-    await setState(env.META_DB, 'theory_backfill_status', 'error');
-    await setState(env.META_DB, 'theory_backfill_error', error instanceof Error ? error.message : String(error));
-  } finally {
-    await setState(env.META_DB, 'theory_backfill_lock_until_ms', '0');
-    rpc.close();
-  }
-}
-
-export interface ScanResult { finalizedBlock:number; scanned:number; stored:number; activeSubnets:number; addedSubnets:number; removedSubnets:number; }
 
 export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanResult> {
   const rpc = new SubtensorRpc(env.SUBTENSOR_WS_URL || DEFAULT_WS);
+  let finalizedBlock = 0;
+  let saved = 0;
+  let catchupMode = false;
   try {
     await rpc.connect();
     const finalizedHash = await rpc.finalizedHead();
     const finalizedHeader = await rpc.header(finalizedHash);
-    const finalizedBlock = parseBlockNumber(finalizedHeader.number);
-    const saved = Number(await getState(env.META_DB, 'last_finalized_block') ?? '0');
+    finalizedBlock = parseBlockNumber(finalizedHeader.number);
+    saved = Number(await getState(env.META_DB, 'last_finalized_block') ?? '0');
+
+    const lagAtStart = saved > 0 ? Math.max(0, finalizedBlock - saved) : 0;
+    catchupMode = saved > 0 && lagAtStart > CATCHUP_THRESHOLD_BLOCKS;
+    const requested = Math.max(1, Math.trunc(maxBlocks));
+    const effectiveMax = catchupMode
+      ? Math.min(requested, CATCHUP_BATCH_BLOCKS)
+      : Math.min(requested, LIVE_BATCH_BLOCKS);
     const start = saved > 0 ? saved + 1 : finalizedBlock;
-    const end = Math.min(finalizedBlock, start + Math.max(1, maxBlocks) - 1);
+    const end = Math.min(finalizedBlock, start + effectiveMax - 1);
+
+    // Publish the real chain head immediately. Even if catch-up later fails,
+    // /api/status can distinguish chain head from the durable local cursor.
+    await writeSyncStates(env.META_DB, {
+      chain_finalized_block: String(finalizedBlock),
+      sync_mode: catchupMode ? 'catchup' : 'live',
+      sync_lag_blocks: String(lagAtStart)
+    });
 
     const formulaVersionBefore = await getState(env.META_DB, 'theory_formula_version');
     if (formulaVersionBefore !== THEORY_MODEL_VERSION) {
@@ -372,9 +328,21 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
     const known = await listKnownNetuids(env.META_DB);
     const candidates = await discoverCandidateNetuids(rpc, finalizedHash, known);
     const latestActive = await readActiveNetuids(rpc, finalizedHash, candidates);
-    const registry = await syncRegistry(env, rpc, finalizedHash, finalizedBlock, candidates, latestActive);
+
+    // Registry metadata is current-head information. During a large historical
+    // catch-up it does not need to be rewritten every 12 seconds.
+    const lastRegistrySync = Number(await getState(env.META_DB, 'last_registry_sync_block') ?? '0');
+    const shouldSyncRegistry = !catchupMode || lastRegistrySync === 0 || finalizedBlock - lastRegistrySync >= 120;
+    const registry = shouldSyncRegistry
+      ? await syncRegistry(env, rpc, finalizedHash, finalizedBlock, candidates, latestActive)
+      : { added: 0, removed: 0 };
 
     let stored = 0;
+    let processedThrough = saved;
+    let lastProcessedTimestampMs = 0;
+    let lastTheoryStats: TheoryStats | null = null;
+    let lastTheoryBlock = 0;
+    let theoryError: string | null = null;
     let parentHash = start === finalizedBlock ? finalizedHeader.parentHash : (start <= end ? await rpc.blockHash(start - 1) : null);
 
     for (let block = start; block <= end; block++) {
@@ -385,46 +353,93 @@ export async function scanToFinalized(env: Env, maxBlocks = 24): Promise<ScanRes
         parentHash = header.parentHash;
       }
 
-      // 1. Critical path: store observed outputs first and advance the cursor.
       const state = await readCoreBlockState(rpc, hash, block, candidates);
-      const inserted = await storeBlock(env, block, hash, state.timestampMs, state.payload);
-      if (inserted) stored++;
-      await setState(env.META_DB, 'last_finalized_block', String(block));
-      await setState(env.META_DB, 'last_sync_ms', String(Date.now()));
 
-      // 2. Best-effort independent reconstruction. Failure cannot roll back step 1.
-      try {
-        const previousFormula = await readFormulaSnapshot(rpc, parentHash, candidates);
-        const stats = applyTheory(state.payload, state.active, previousFormula, block);
-        if (stats.enriched > 0) {
-          await updateBlockPayload(env, block, state.timestampMs, state.payload);
-          await setState(env.META_DB, 'theory_last_block', String(block));
+      // While far behind, prioritize durable observed data. Independent theory
+      // is intentionally deferred to the archive backfiller, avoiding duplicate
+      // historical RPC + D1 writes in the same invocation.
+      if (!catchupMode) {
+        try {
+          const previousFormula = await readFormulaSnapshot(rpc, parentHash, candidates);
+          const stats = applyTheory(state.payload, state.active, previousFormula, block);
+          lastTheoryStats = stats;
+          lastTheoryBlock = block;
+          theoryError = null;
+        } catch (error) {
+          theoryError = error instanceof Error ? error.message : String(error);
         }
-        await setState(env.META_DB, 'theory_status', stats.enriched > 0 ? 'ok' : 'partial');
-        await setState(env.META_DB, 'theory_last_enriched', String(stats.enriched));
-        await setState(env.META_DB, 'theory_last_missing_root', String(stats.missingRoot));
-        await setState(env.META_DB, 'theory_last_missing_alpha', String(stats.missingAlpha));
-        await setState(env.META_DB, 'theory_last_missing_price', String(stats.missingPrice));
-        await setState(env.META_DB, 'theory_last_equal_actual', String(stats.equalActual));
-        await setState(env.META_DB, 'theory_last_different_actual', String(stats.differentActual));
-        await env.META_DB.prepare("DELETE FROM sync_state WHERE key='theory_last_error'").run();
-      } catch (error) {
-        await setState(env.META_DB, 'theory_status', 'partial');
-        await setState(env.META_DB, 'theory_last_error', error instanceof Error ? error.message : String(error));
       }
 
+      if (await storeBlock(env, block, hash, state.timestampMs, state.payload)) stored++;
+      else if (!catchupMode && lastTheoryStats?.enriched) {
+        await updateBlockPayload(env, block, state.timestampMs, state.payload);
+      }
+
+      processedThrough = block;
+      lastProcessedTimestampMs = state.timestampMs;
       parentHash = hash;
     }
 
-    const latestTimestampMs = Number(decodeU64((await rpc.queryStorage([TIMESTAMP_NOW_KEY], finalizedHash)).get(TIMESTAMP_NOW_KEY) ?? null));
-    if (latestTimestampMs > 0) await ensureClosedHourlySummaries(env, latestTimestampMs);
-    await setState(env.META_DB, 'rpc_status', 'ok');
-    await setState(env.META_DB, 'chain_finalized_block', String(finalizedBlock));
+    // Hourly summaries must only advance to the time actually collected. Using
+    // the current chain-head timestamp while thousands of blocks are missing
+    // would create empty hours and can itself exhaust Cloudflare subrequests.
+    if (lastProcessedTimestampMs > 0) {
+      await ensureClosedHourlySummaries(env, lastProcessedTimestampMs);
+    }
+
+    const remainingLag = Math.max(0, finalizedBlock - Math.max(processedThrough, saved));
+    const finalMode: 'live' | 'catchup' = remainingLag > CATCHUP_THRESHOLD_BLOCKS ? 'catchup' : 'live';
+    const stateValues: Record<string,string> = {
+      last_finalized_block: String(Math.max(processedThrough, saved)),
+      last_sync_ms: String(Date.now()),
+      rpc_status: 'ok',
+      sync_mode: finalMode,
+      sync_lag_blocks: String(remainingLag)
+    };
+
+    if (lastTheoryStats && lastTheoryBlock > 0) {
+      stateValues.theory_status = lastTheoryStats.enriched > 0 ? 'ok' : 'partial';
+      stateValues.theory_last_block = String(lastTheoryBlock);
+      stateValues.theory_last_enriched = String(lastTheoryStats.enriched);
+      stateValues.theory_last_missing_root = String(lastTheoryStats.missingRoot);
+      stateValues.theory_last_missing_alpha = String(lastTheoryStats.missingAlpha);
+      stateValues.theory_last_missing_price = String(lastTheoryStats.missingPrice);
+      stateValues.theory_last_equal_actual = String(lastTheoryStats.equalActual);
+      stateValues.theory_last_different_actual = String(lastTheoryStats.differentActual);
+    } else if (theoryError) {
+      stateValues.theory_status = 'partial';
+      stateValues.theory_last_error = theoryError;
+    }
+
+    await writeSyncStates(env.META_DB, stateValues);
     await env.META_DB.prepare("DELETE FROM sync_state WHERE key='last_error'").run();
-    return { finalizedBlock, scanned: start <= end ? end-start+1 : 0, stored, activeSubnets: latestActive.length, addedSubnets: registry.added, removedSubnets: registry.removed };
+    if (lastTheoryStats && !theoryError) {
+      await env.META_DB.prepare("DELETE FROM sync_state WHERE key='theory_last_error'").run();
+    }
+
+    return {
+      finalizedBlock,
+      processedThroughBlock: Math.max(processedThrough, saved),
+      remainingLag,
+      syncMode: finalMode,
+      scanned: start <= end ? end - start + 1 : 0,
+      stored,
+      activeSubnets: latestActive.length,
+      addedSubnets: registry.added,
+      removedSubnets: registry.removed
+    };
   } catch (error) {
-    await setState(env.META_DB, 'rpc_status', 'error');
-    await setState(env.META_DB, 'last_error', error instanceof Error ? error.message : String(error));
+    const message = error instanceof Error ? error.message : String(error);
+    const remainingLag = finalizedBlock > 0 ? Math.max(0, finalizedBlock - saved) : 0;
+    await writeSyncStates(env.META_DB, {
+      rpc_status: 'error',
+      last_error: message,
+      ...(finalizedBlock > 0 ? { chain_finalized_block: String(finalizedBlock) } : {}),
+      sync_mode: catchupMode ? 'catchup' : 'live',
+      sync_lag_blocks: String(remainingLag)
+    });
     throw error;
-  } finally { rpc.close(); }
+  } finally {
+    rpc.close();
+  }
 }
