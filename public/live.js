@@ -1,10 +1,9 @@
 const LIVE_REFRESH_MS=12_000;
-const LIVE_SYNC_MAX_BLOCKS=8;
-const LIVE_OVERVIEW_REFRESH_MS=60_000;
+const LIVE_OVERVIEW_REFRESH_MS=12_000;
 let liveBusy=false;
 let liveLastFinalized=0;
 let liveLastRegistryRefresh=0;
-let liveLastOverviewRefresh=Date.now();
+let liveLastOverviewRefresh=0;
 let liveOverviewBusy=false;
 let liveAdjustingRange=false;
 
@@ -12,7 +11,7 @@ function livePreset(){return document.querySelector('.preset.active')?.dataset?.
 function liveRangeMs(mode){if(mode==='24h')return DAY_MS;if(mode==='7d')return 7*DAY_MS;if(mode==='30d')return 30*DAY_MS;return null;}
 function liveRollRange(){const span=liveRangeMs(livePreset());if(span==null)return false;const end=new Date(),start=new Date(end.getTime()-span);liveAdjustingRange=true;document.getElementById('startTime').value=toLocalInput(start);document.getElementById('endTime').value=toLocalInput(end);liveAdjustingRange=false;return true;}
 
-function liveApplyStatus(s){const ok=s.rpcStatus==='ok';document.getElementById('activeCount').textContent=Number(s.activeSubnets||0).toLocaleString();document.getElementById('addedCount').textContent=Number(s.addedLastSync||0).toLocaleString();document.getElementById('removedCount').textContent=Number(s.removedLastSync||0).toLocaleString();document.getElementById('syncBlock').textContent=Number(s.lastFinalizedBlock||0).toLocaleString();document.getElementById('rpcStatusText').textContent=ok?'链上连接正常':s.rpcStatus==='error'?'链上连接异常':'等待首次同步';document.getElementById('rpcDot').style.background=ok?'var(--good)':'var(--bad)';document.getElementById('syncStateLabel').textContent=ok?'实时同步':'异常';document.getElementById('syncTime').textContent=s.lastSyncMs?`最后更新：${fmtDate(s.lastSyncMs).slice(11)} · 12 秒自动刷新`:'等待首次同步';}
+function liveApplyStatus(s){const ok=s.rpcStatus==='ok';document.getElementById('activeCount').textContent=Number(s.activeSubnets||0).toLocaleString();document.getElementById('addedCount').textContent=Number(s.addedLastSync||0).toLocaleString();document.getElementById('removedCount').textContent=Number(s.removedLastSync||0).toLocaleString();document.getElementById('syncBlock').textContent=Number(s.lastFinalizedBlock||0).toLocaleString();document.getElementById('rpcStatusText').textContent=ok?'链上连接正常':s.rpcStatus==='error'?'链上连接异常':'等待首次同步';document.getElementById('rpcDot').style.background=ok?'var(--good)':'var(--bad)';document.getElementById('syncStateLabel').textContent=ok?'实时同步':'异常';document.getElementById('syncTime').textContent=s.lastSyncMs?`最后更新：${fmtDate(s.lastSyncMs).slice(11)} · 后台 12 秒采集 · 页面 12 秒刷新`:'等待首次同步';}
 
 function liveRecomputeRows(from,to){rows=rows.filter(r=>r.time.getTime()>=from&&r.time.getTime()<=to).sort((a,b)=>a.time-b.time||a.block-b.block);let cumA=0;for(let i=0;i<rows.length;i++){const r=rows[i];r.i=i+1;cumA+=r.actual;r.cumA=cumA;}}
 function liveRefreshFilteredRows(){const q=document.getElementById('blockSearch').value.trim().toLowerCase().replace(/,/g,'').replace('#','');filteredRows=!q?rows.slice():rows.filter(r=>String(r.block).includes(q)||String(r.i)===q||fmtDate(r.time).toLowerCase().includes(q));sortBlockRows();const oldScroll=list.scrollTop;resetVirtual(false);list.scrollTop=oldScroll;renderVirtual();document.querySelector('.table-foot > div:first-child').textContent=rows.length?'实际链上数据已更新 · 连续滚动':'该时间范围暂无区块数据';}
@@ -44,25 +43,36 @@ function liveRefreshOverviewInBackground(){
 }
 
 async function liveTick(){
-  if(liveBusy||document.visibilityState==='hidden')return;liveBusy=true;
+  if(liveBusy)return;liveBusy=true;
   try{
-    if(liveLastFinalized===0){const baseline=await apiJson('/api/status');liveLastFinalized=Number(baseline.lastFinalizedBlock||0);liveApplyStatus(baseline);}
-    const sync=await apiJson(`/api/sync?max=${LIVE_SYNC_MAX_BLOCKS}`,{method:'POST'});const finalized=Number(sync.finalizedBlock||0),advanced=finalized>liveLastFinalized;if(finalized>0)liveLastFinalized=finalized;
+    // The chain is collected by a Durable Object alarm in the backend. The
+    // browser only reads D1 state, so switching tabs or closing the page no
+    // longer controls whether blocks are captured.
+    const status=await apiJson('/api/status');
+    const finalized=Number(status.lastFinalizedBlock||0);
     const rolling=liveRollRange();
 
-    // The selected subnet is the real-time priority. Read its newly stored block
-    // immediately after the chain sync, before any expensive all-subnet summary.
+    if(liveLastFinalized===0){
+      liveLastFinalized=finalized;
+      liveApplyStatus(status);
+      if(rolling)liveRefreshOverviewInBackground();
+      return;
+    }
+
+    const advanced=finalized>liveLastFinalized;
+    if(finalized>0)liveLastFinalized=finalized;
+
+    // Current subnet detail remains first priority whenever a new finalized
+    // block has arrived in D1.
     if(rolling&&advanced){const {from,to}=selectedRange();await liveAppendDetail(from,to);}
 
-    // Only show the new sync timestamp after the detail table has caught up, so
-    // the header and the newest visible block do not appear minutes apart.
-    const status=await apiJson('/api/status');liveApplyStatus(status);
+    liveApplyStatus(status);
 
     if(Date.now()-liveLastRegistryRefresh>5*60_000||Number(status.activeSubnets)!==subnetRegistry.filter(x=>x.status==='active').length){await loadSubnets();liveLastRegistryRefresh=Date.now();}
 
-    // The 128-subnet 24h aggregate is much heavier and does not need 12-second
-    // recomputation. Refresh it independently at most once per minute.
-    if(rolling&&advanced)liveRefreshOverviewInBackground();
+    // All-subnet summary is requested every 12 seconds as well, but stays
+    // asynchronous so it cannot delay the selected subnet detail table.
+    if(rolling)liveRefreshOverviewInBackground();
   }catch(error){console.warn('live refresh failed',error);document.getElementById('syncStateLabel').textContent='实时同步重试中';}
   finally{liveBusy=false;}
 }
