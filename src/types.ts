@@ -5,6 +5,7 @@ export interface Env {
   BLOCKS_2: D1Database;
   BLOCKS_3: D1Database;
   ASSETS: Fetcher;
+  CHAIN_COLLECTOR: DurableObjectNamespace;
   SUBTENSOR_WS_URL?: string;
   RETENTION_DAYS?: string;
 }
