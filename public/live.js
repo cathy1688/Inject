@@ -36,14 +36,38 @@ async function liveTick(){
   finally{liveBusy=false;}
 }
 
+function datetimeSeconds(value){
+  const match=String(value||'').match(/T\d{2}:\d{2}:(\d{2})/);
+  return match?match[1]:null;
+}
+
 ['startTime','endTime'].forEach(id=>{
   const input=document.getElementById(id);
   if(!input)return;
+  let lastSeconds=datetimeSeconds(input.value);
+
+  // Remember the current seconds when the native picker opens. Chromium emits
+  // `input` while date/hour/minute/second columns are changed, so only a change
+  // in the seconds segment should finish the interaction and close the picker.
+  const rememberSeconds=()=>{lastSeconds=datetimeSeconds(input.value);};
+  input.addEventListener('focus',rememberSeconds);
+  input.addEventListener('pointerdown',rememberSeconds);
+
+  input.addEventListener('input',()=>{
+    if(!liveAdjustingRange)document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range==='custom'));
+    const seconds=datetimeSeconds(input.value);
+    if(seconds!=null&&lastSeconds!=null&&seconds!==lastSeconds){
+      lastSeconds=seconds;
+      requestAnimationFrame(()=>input.blur());
+      return;
+    }
+    lastSeconds=seconds;
+  });
+
+  // Fallback for keyboard/manual edits and browsers that only dispatch change
+  // after the full value has been committed.
   input.addEventListener('change',()=>{
     if(!liveAdjustingRange)document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range==='custom'));
-    // Chromium keeps the native datetime panel open after the value is chosen.
-    // Blur on the next frame so the committed value remains intact and the panel closes.
-    requestAnimationFrame(()=>input.blur());
   });
   input.addEventListener('keydown',event=>{if(event.key==='Enter')input.blur();});
 });
