@@ -34,6 +34,8 @@ export class SubtensorRpc {
   private id = 0;
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; timer: ReturnType<typeof setTimeout> }>();
   private readonly historicalFallbackUrls: readonly string[];
+  private historicalFallbackRpc: SubtensorRpc | null = null;
+  private historicalFallbackUrl: string | null = null;
 
   constructor(private readonly url: string, historicalFallbackUrls?: readonly string[]) {
     // Normal Finney nodes prune old state. Keep them as the fast primary for live
@@ -106,7 +108,7 @@ export class SubtensorRpc {
     return prepared.promise;
   }
 
-  /** Retry one pruned historical operation on archive nodes, without changing the live primary connection. */
+  /** Retry one pruned historical operation on archive nodes, while retaining the live Finney connection. */
   private async withHistoricalFallback<T>(
     originalError: unknown,
     operation: (rpc: SubtensorRpc) => Promise<T>
@@ -115,14 +117,24 @@ export class SubtensorRpc {
 
     const errors: string[] = [];
     for (const endpoint of this.historicalFallbackUrls) {
-      const archive = new SubtensorRpc(endpoint, []);
+      let archive = this.historicalFallbackRpc;
+      if (!archive || this.historicalFallbackUrl !== endpoint) {
+        archive?.close();
+        archive = new SubtensorRpc(endpoint, []);
+        this.historicalFallbackRpc = archive;
+        this.historicalFallbackUrl = endpoint;
+      }
+
       try {
         await archive.connect();
         return await operation(archive);
       } catch (error) {
         errors.push(`${endpoint}: ${errorText(error)}`);
-      } finally {
         archive.close();
+        if (this.historicalFallbackRpc === archive) {
+          this.historicalFallbackRpc = null;
+          this.historicalFallbackUrl = null;
+        }
       }
     }
 
@@ -156,7 +168,8 @@ export class SubtensorRpc {
    * querying a vector of storage keys at one block.
    *
    * If the live node has already pruned `atHash`, only that historical request
-   * is retried against archive RPC. Current-state traffic remains on Finney.
+   * is retried against a reusable archive connection. Current-state traffic
+   * remains on Finney.
    */
   async queryStorage(keys: string[], atHash: string): Promise<Map<string, string | null>> {
     try {
@@ -194,6 +207,10 @@ export class SubtensorRpc {
   close(): void {
     try { this.ws?.close(1000, 'done'); } catch {}
     this.ws = null;
+    const archive = this.historicalFallbackRpc;
+    this.historicalFallbackRpc = null;
+    this.historicalFallbackUrl = null;
+    archive?.close();
   }
 }
 
