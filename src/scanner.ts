@@ -20,13 +20,21 @@ import {
 
 const DEFAULT_WS = 'wss://entrypoint-finney.opentensor.ai:443';
 const ROOT_NETUID = 0;
-const EMISSION_PROBE_INTERVAL_BLOCKS = 5; // ~1 minute at 12s blocks.
 const REGISTRY_REFRESH_INTERVAL_BLOCKS = 25; // ~5 minutes.
 const ZERO_STREAK_TO_PAUSE = 3;
+const UTC8_OFFSET_MS = 8 * 60 * 60 * 1000;
 
 interface EmissionValue {
   actual: bigint;
   chainBuy: bigint;
+}
+
+function utc8DayKey(now = Date.now()): string {
+  return new Date(now + UTC8_OFFSET_MS).toISOString().slice(0,10);
+}
+
+function isUtc8MidnightHour(now = Date.now()): boolean {
+  return new Date(now + UTC8_OFFSET_MS).getUTCHours() === 0;
 }
 
 function parseNetuidList(raw: string | undefined): number[] {
@@ -62,7 +70,7 @@ async function readScannerState(env: Env): Promise<Map<string,string>> {
     SELECT key,value FROM sync_state
     WHERE key IN (
       'last_finalized_block','last_registry_sync_block','emitting_netuids',
-      'emission_probe_block','emission_zero_streaks'
+      'emission_probe_day','emission_probe_block','emission_zero_streaks'
     )
   `).all<{key:string;value:string}>();
   return new Map(rows.results.map(row => [String(row.key), String(row.value)]));
@@ -133,8 +141,6 @@ async function readBlockState(
     const actual=decodeU64(state.get(storageKeys.taoInEmission(netuid)) ?? null);
     const chainBuy=decodeU64(state.get(storageKeys.excessTao(netuid)) ?? null);
     values.set(netuid,{actual,chainBuy});
-    // Zero-emission rows are deliberately not persisted. The subnet remains in
-    // the registry and will be periodically probed for emission resumption.
     if(actual<=0n && chainBuy<=0n) continue;
     payload[String(netuid)]=[actual.toString(),chainBuy.toString()];
   }
@@ -150,11 +156,14 @@ async function syncRegistry(env:Env,rpc:SubtensorRpc,hash:string,blockNumber:num
   const previous=await env.META_DB.prepare('SELECT netuid,status,first_seen_block,name FROM subnets WHERE netuid > 0').all<{netuid:number;status:string;first_seen_block:number;name:string}>();
   const prevMap=new Map(previous.results.map(r=>[Number(r.netuid),r]));
   const activeSet=new Set(safeActive);
-  const rows:SubnetRecord[]=[];let added=0,removed=0;const now=Date.now();
+  const rows:SubnetRecord[]=[];
+  const newlyActive:number[]=[];
+  let added=0,removed=0;
+  const now=Date.now();
   for(const netuid of candidates){
     if(netuid===ROOT_NETUID)continue;
     const prev=prevMap.get(netuid),isActive=activeSet.has(netuid);
-    if(isActive&&(!prev||prev.status!=='active'))added++;
+    if(isActive&&(!prev||prev.status!=='active')){added++;newlyActive.push(netuid);}
     if(!isActive&&prev?.status==='active')removed++;
     if(!prev&&!isActive)continue;
     rows.push({
@@ -169,7 +178,7 @@ async function syncRegistry(env:Env,rpc:SubtensorRpc,hash:string,blockNumber:num
   }
   await upsertSubnets(env.META_DB,rows);
   await env.META_DB.prepare('DELETE FROM subnets WHERE netuid = 0').run();
-  return {added,removed};
+  return {added,removed,newlyActive};
 }
 
 export interface ScanResult {
@@ -179,7 +188,7 @@ export interface ScanResult {
   activeSubnets:number;
   emittingSubnets:number;
   pausedZeroEmissionSubnets:number;
-  emissionProbeBlock:number;
+  emissionProbeDay:string | null;
   addedSubnets:number;
   removedSubnets:number;
 }
@@ -189,12 +198,10 @@ export interface ScanResult {
  *
  * - Subnets currently emitting TAO/Chain Buy stay on the per-block fast path.
  * - A subnet is paused after 3 consecutive zero-emission blocks.
- * - Paused subnets are probed together every 5 blocks (~1 minute). If emission
- *   resumes, they automatically rejoin per-block monitoring.
- * - Registry discovery/names are refreshed every 25 blocks (~5 minutes), not
- *   on every browser poll.
- * - Deep gaps are still intentionally skipped; only the recent maxBlocks are
- *   considered after a short outage.
+ * - Paused subnets are probed once per day during the 00:00 hour in UTC+8.
+ * - Newly registered/reenabled subnets are checked immediately once.
+ * - Registry discovery/names are refreshed every 25 blocks (~5 minutes).
+ * - Deep gaps are intentionally skipped; only recent maxBlocks are considered.
  */
 export async function scanToFinalized(env: Env, maxBlocks = 8): Promise<ScanResult> {
   const rpc=new SubtensorRpc(env.SUBTENSOR_WS_URL||DEFAULT_WS);
@@ -207,8 +214,9 @@ export async function scanToFinalized(env: Env, maxBlocks = 8): Promise<ScanResu
     const scannerState=await readScannerState(env);
     const saved=Number(scannerState.get('last_finalized_block') ?? '0');
     const lastRegistryBlock=Number(scannerState.get('last_registry_sync_block') ?? '0');
-    let lastProbeBlock=Number(scannerState.get('emission_probe_block') ?? '0');
+    const hadEmissionState=scannerState.has('emitting_netuids');
     const zeroStreaks=parseZeroStreaks(scannerState.get('emission_zero_streaks'));
+    let probeDay=scannerState.get('emission_probe_day') ?? '';
 
     let start=saved>0?saved+1:finalizedBlock;
     start=Math.max(start,finalizedBlock-Math.max(1,Math.trunc(maxBlocks))+1);
@@ -216,7 +224,7 @@ export async function scanToFinalized(env: Env, maxBlocks = 8): Promise<ScanResu
     const known=await listKnownNetuids(env.META_DB);
     const registryDue=known.length===0 || lastRegistryBlock===0 || finalizedBlock-lastRegistryBlock>=REGISTRY_REFRESH_INTERVAL_BLOCKS;
     let latestActive:number[];
-    let registry={added:0,removed:0};
+    let registry={added:0,removed:0,newlyActive:[] as number[]};
     let registrySyncBlock=lastRegistryBlock;
 
     if(registryDue){
@@ -232,19 +240,35 @@ export async function scanToFinalized(env: Env, maxBlocks = 8): Promise<ScanResu
     const monitored=new Set(parseNetuidList(scannerState.get('emitting_netuids')).filter(n=>activeSet.has(n)));
     for(const key of Object.keys(zeroStreaks)) if(!monitored.has(Number(key))) delete zeroStreaks[key];
 
-    const shouldProbe=monitored.size===0 || lastProbeBlock===0 || finalizedBlock-lastProbeBlock>=EMISSION_PROBE_INTERVAL_BLOCKS;
-    if(shouldProbe){
-      const paused=latestActive.filter(netuid=>!monitored.has(netuid));
-      const probe=await readEmissionValues(rpc,finalizedHash,paused);
-      for(const netuid of paused){
+    const today=utc8DayKey();
+    const dailyProbeDue=isUtc8MidnightHour() && probeDay!==today;
+    const probeTargets=new Set<number>();
+
+    // First initialization needs one full check to discover the emitting set.
+    if(!hadEmissionState){
+      for(const netuid of latestActive) if(!monitored.has(netuid)) probeTargets.add(netuid);
+    }
+
+    // Newly registered/reenabled subnets are checked immediately once.
+    for(const netuid of registry.newlyActive) if(!monitored.has(netuid)) probeTargets.add(netuid);
+
+    // Existing paused subnets are otherwise checked only once at UTC+8 midnight.
+    if(dailyProbeDue){
+      for(const netuid of latestActive) if(!monitored.has(netuid)) probeTargets.add(netuid);
+    }
+
+    if(probeTargets.size>0){
+      const targets=[...probeTargets].sort((a,b)=>a-b);
+      const probe=await readEmissionValues(rpc,finalizedHash,targets);
+      for(const netuid of targets){
         const value=probe.get(netuid);
         if(value && (value.actual>0n || value.chainBuy>0n)){
           monitored.add(netuid);
           zeroStreaks[String(netuid)]=0;
         }
       }
-      lastProbeBlock=finalizedBlock;
     }
+    if(dailyProbeDue) probeDay=today;
 
     let stored=0,lastTimestampMs=0;
     for(let block=start;block<=finalizedBlock;block++){
@@ -289,12 +313,15 @@ export async function scanToFinalized(env: Env, maxBlocks = 8): Promise<ScanResu
       emitting_netuids:JSON.stringify(emitting),
       emitting_subnet_count:String(emitting.length),
       zero_emission_subnet_count:String(pausedCount),
-      emission_probe_block:String(lastProbeBlock),
-      emission_probe_interval_blocks:String(EMISSION_PROBE_INTERVAL_BLOCKS),
+      emission_probe_day:probeDay,
+      emission_probe_schedule:'00:00 UTC+8 daily',
       emission_zero_streaks:JSON.stringify(cleanStreaks),
       emission_zero_pause_blocks:String(ZERO_STREAK_TO_PAUSE),
-      scanner_mode:'emission-aware'
+      scanner_mode:'emission-aware-daily-probe'
     });
+    if(scannerState.has('emission_probe_block')){
+      await env.META_DB.prepare("DELETE FROM sync_state WHERE key IN ('emission_probe_block','emission_probe_interval_blocks')").run();
+    }
     await env.META_DB.prepare("DELETE FROM sync_state WHERE key='last_error'").run();
     return {
       finalizedBlock,
@@ -303,7 +330,7 @@ export async function scanToFinalized(env: Env, maxBlocks = 8): Promise<ScanResu
       activeSubnets:latestActive.length,
       emittingSubnets:emitting.length,
       pausedZeroEmissionSubnets:pausedCount,
-      emissionProbeBlock:lastProbeBlock,
+      emissionProbeDay:probeDay||null,
       addedSubnets:registry.added,
       removedSubnets:registry.removed
     };
