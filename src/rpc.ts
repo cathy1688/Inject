@@ -15,12 +15,32 @@ export interface RpcSubnetPrice {
   price: number | string;
 }
 
+const DEFAULT_ARCHIVE_ENDPOINTS = [
+  'wss://archive.chain.opentensor.ai:443',
+  'wss://archive.sub.latent.to:443'
+] as const;
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isPrunedHistoricalStateError(error: unknown): boolean {
+  const text = errorText(error).toLowerCase();
+  return text.includes('unknownblock') || text.includes('state already discarded') || text.includes('state discarded');
+}
+
 export class SubtensorRpc {
   private ws: WebSocket | null = null;
   private id = 0;
   private pending = new Map<number, { resolve: (value: unknown) => void; reject: (reason?: unknown) => void; timer: ReturnType<typeof setTimeout> }>();
+  private readonly historicalFallbackUrls: readonly string[];
 
-  constructor(private readonly url: string) {}
+  constructor(private readonly url: string, historicalFallbackUrls?: readonly string[]) {
+    // Normal Finney nodes prune old state. Keep them as the fast primary for live
+    // reads, but transparently retry pruned historical state against archive RPC.
+    this.historicalFallbackUrls = historicalFallbackUrls ??
+      (url.includes('entrypoint-finney') ? DEFAULT_ARCHIVE_ENDPOINTS : []);
+  }
 
   async connect(): Promise<void> {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) return;
@@ -86,16 +106,47 @@ export class SubtensorRpc {
     return prepared.promise;
   }
 
+  /** Retry one pruned historical operation on archive nodes, without changing the live primary connection. */
+  private async withHistoricalFallback<T>(
+    originalError: unknown,
+    operation: (rpc: SubtensorRpc) => Promise<T>
+  ): Promise<T> {
+    if (!isPrunedHistoricalStateError(originalError) || !this.historicalFallbackUrls.length) throw originalError;
+
+    const errors: string[] = [];
+    for (const endpoint of this.historicalFallbackUrls) {
+      const archive = new SubtensorRpc(endpoint, []);
+      try {
+        await archive.connect();
+        return await operation(archive);
+      } catch (error) {
+        errors.push(`${endpoint}: ${errorText(error)}`);
+      } finally {
+        archive.close();
+      }
+    }
+
+    throw new Error(`${errorText(originalError)}; archive fallback failed: ${errors.join(' | ')}`);
+  }
+
   finalizedHead(): Promise<string> { return this.call<string>('chain_getFinalizedHead'); }
   async header(hash: string): Promise<{ number: string; parentHash: string }> { return this.call('chain_getHeader', [hash]); }
   blockHash(blockNumber: number): Promise<string | null> { return this.call<string | null>('chain_getBlockHash', [blockNumber]); }
 
-  currentAlphaPricesAll(atHash: string): Promise<RpcSubnetPrice[]> {
-    return this.call<RpcSubnetPrice[]>('swap_currentAlphaPriceAll', [atHash]);
+  async currentAlphaPricesAll(atHash: string): Promise<RpcSubnetPrice[]> {
+    try {
+      return await this.call<RpcSubnetPrice[]>('swap_currentAlphaPriceAll', [atHash]);
+    } catch (error) {
+      return this.withHistoricalFallback(error, rpc => rpc.currentAlphaPricesAll(atHash));
+    }
   }
 
-  currentAlphaPricesAllScale(atHash: string): Promise<string> {
-    return this.call<string>('state_call', ['SwapRuntimeApi_current_alpha_price_all', '0x', atHash]);
+  async currentAlphaPricesAllScale(atHash: string): Promise<string> {
+    try {
+      return await this.call<string>('state_call', ['SwapRuntimeApi_current_alpha_price_all', '0x', atHash]);
+    } catch (error) {
+      return this.withHistoricalFallback(error, rpc => rpc.currentAlphaPricesAllScale(atHash));
+    }
   }
 
   /**
@@ -103,19 +154,26 @@ export class SubtensorRpc {
    * endpoint timed out on JSON-RPC batch arrays of many `state_getStorage`
    * requests. Substrate exposes `state_queryStorageAt` specifically for
    * querying a vector of storage keys at one block.
+   *
+   * If the live node has already pruned `atHash`, only that historical request
+   * is retried against archive RPC. Current-state traffic remains on Finney.
    */
   async queryStorage(keys: string[], atHash: string): Promise<Map<string, string | null>> {
-    const map = new Map<string, string | null>();
-    const chunkSize = 256;
-    for (let i = 0; i < keys.length; i += chunkSize) {
-      const chunk = keys.slice(i, i + chunkSize);
-      chunk.forEach(key => map.set(key, null));
-      const sets = await this.call<StorageChangeSet[]>('state_queryStorageAt', [chunk, atHash]);
-      for (const set of sets ?? []) {
-        for (const [key, value] of set.changes ?? []) map.set(key, value);
+    try {
+      const map = new Map<string, string | null>();
+      const chunkSize = 256;
+      for (let i = 0; i < keys.length; i += chunkSize) {
+        const chunk = keys.slice(i, i + chunkSize);
+        chunk.forEach(key => map.set(key, null));
+        const sets = await this.call<StorageChangeSet[]>('state_queryStorageAt', [chunk, atHash]);
+        for (const set of sets ?? []) {
+          for (const [key, value] of set.changes ?? []) map.set(key, value);
+        }
       }
+      return map;
+    } catch (error) {
+      return this.withHistoricalFallback(error, rpc => rpc.queryStorage(keys, atHash));
     }
-    return map;
   }
 
   async keysPaged(prefix: string, atHash: string, pageSize = 512): Promise<string[]> {
