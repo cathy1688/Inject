@@ -36,6 +36,16 @@ async function liveTick(){
   finally{liveBusy=false;}
 }
 
-['startTime','endTime'].forEach(id=>document.getElementById(id)?.addEventListener('change',()=>{if(liveAdjustingRange)return;document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range==='custom'));}));
+['startTime','endTime'].forEach(id=>{
+  const input=document.getElementById(id);
+  if(!input)return;
+  input.addEventListener('change',()=>{
+    if(!liveAdjustingRange)document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range==='custom'));
+    // Chromium keeps the native datetime panel open after the value is chosen.
+    // Blur on the next frame so the committed value remains intact and the panel closes.
+    requestAnimationFrame(()=>input.blur());
+  });
+  input.addEventListener('keydown',event=>{if(event.key==='Enter')input.blur();});
+});
 window.addEventListener('load',()=>{setTimeout(()=>liveTick(),LIVE_REFRESH_MS);setInterval(()=>liveTick(),LIVE_REFRESH_MS);});
 document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')liveTick();});
