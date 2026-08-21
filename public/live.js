@@ -1,8 +1,11 @@
 const LIVE_REFRESH_MS=12_000;
 const LIVE_SYNC_MAX_BLOCKS=8;
+const LIVE_OVERVIEW_REFRESH_MS=60_000;
 let liveBusy=false;
 let liveLastFinalized=0;
 let liveLastRegistryRefresh=0;
+let liveLastOverviewRefresh=Date.now();
+let liveOverviewBusy=false;
 let liveAdjustingRange=false;
 
 function livePreset(){return document.querySelector('.preset.active')?.dataset?.range||'custom';}
@@ -14,24 +17,52 @@ function liveApplyStatus(s){const ok=s.rpcStatus==='ok';document.getElementById(
 function liveRecomputeRows(from,to){rows=rows.filter(r=>r.time.getTime()>=from&&r.time.getTime()<=to).sort((a,b)=>a.time-b.time||a.block-b.block);let cumA=0;for(let i=0;i<rows.length;i++){const r=rows[i];r.i=i+1;cumA+=r.actual;r.cumA=cumA;}}
 function liveRefreshFilteredRows(){const q=document.getElementById('blockSearch').value.trim().toLowerCase().replace(/,/g,'').replace('#','');filteredRows=!q?rows.slice():rows.filter(r=>String(r.block).includes(q)||String(r.i)===q||fmtDate(r.time).toLowerCase().includes(q));sortBlockRows();const oldScroll=list.scrollTop;resetVirtual(false);list.scrollTop=oldScroll;renderVirtual();document.querySelector('.table-foot > div:first-child').textContent=rows.length?'实际链上数据已更新 · 连续滚动':'该时间范围暂无区块数据';}
 
+function liveUpdateSelectedMetrics(){
+  const actual=rows.reduce((sum,r)=>sum+r.actual,0),chain=rows.reduce((sum,r)=>sum+r.chainBuy,0),total=actual+chain,count=rows.length;
+  const meta=subnetRegistry.find(x=>x.netuid===selectedSubnet);
+  document.getElementById('totalActual').textContent=count?'τ '+fmtNum(actual,6):'—';
+  document.getElementById('totalChainBuy').textContent=count?'τ '+fmtNum(chain,6):'—';
+  document.getElementById('totalEmission').textContent=count?'τ '+fmtNum(total,6):'—';
+  document.getElementById('blockCount').textContent=count.toLocaleString();
+  document.getElementById('coverage').textContent=count?`${count.toLocaleString()} 个 finalized 区块`:'该时间范围暂无区块数据';
+  document.getElementById('avgActual').textContent=count?'τ '+fmtNum(actual/count,8):'—';
+  document.getElementById('trendTitle').textContent=`SN${selectedSubnet} · ${meta?.name||''}｜实际注入趋势`;
+}
+
 async function liveAppendDetail(from,to){
-  if(!rows.length){await loadDetail();return;}
-  const lastTime=rows[rows.length-1].time.getTime(),queryFrom=Math.max(from,lastTime+1);if(queryFrom>to){liveRecomputeRows(from,to);liveRefreshFilteredRows();return;}
-  const data=await apiJson('/api/blocks?'+queryString({netuid:selectedSubnet,from:queryFrom,to,offset:0,limit:100}));const seen=new Set(rows.slice(-32).map(r=>r.block));
+  const queryFrom=rows.length?Math.max(from,rows[rows.length-1].time.getTime()+1):Math.max(from,to-5*60_000);
+  if(queryFrom>to){liveRecomputeRows(from,to);liveRefreshFilteredRows();liveUpdateSelectedMetrics();return;}
+  const data=await apiJson('/api/blocks?'+queryString({netuid:selectedSubnet,from:queryFrom,to,offset:0,limit:100}));const seen=new Set(rows.slice(-64).map(r=>r.block));
   for(const item of data.items||[]){const block=Number(item.block_number);if(seen.has(block))continue;const actual=tao(item.actual_rao),chainBuy=tao(item.chain_buy_rao);rows.push({i:0,block,time:new Date(Number(item.timestamp_ms)),actual,chainBuy,totalEmission:actual+chainBuy,cumA:0});seen.add(block);}
-  liveRecomputeRows(from,to);liveRefreshFilteredRows();document.getElementById('rangeText').textContent=`${fmtDate(from)} — ${fmtDate(to)}`;await loadChart();
+  liveRecomputeRows(from,to);liveRefreshFilteredRows();liveUpdateSelectedMetrics();document.getElementById('rangeText').textContent=`${fmtDate(from)} — ${fmtDate(to)}`;await loadChart();
+}
+
+function liveRefreshOverviewInBackground(){
+  if(liveOverviewBusy||Date.now()-liveLastOverviewRefresh<LIVE_OVERVIEW_REFRESH_MS)return;
+  liveOverviewBusy=true;liveLastOverviewRefresh=Date.now();
+  loadOverview().catch(error=>console.warn('overview refresh failed',error)).finally(()=>{liveOverviewBusy=false;});
 }
 
 async function liveTick(){
   if(liveBusy||document.visibilityState==='hidden')return;liveBusy=true;
   try{
-    // Establish a baseline from the already-saved D1 state so the first live tick
-    // does not mistake the entire existing dataset for a new update and reload it.
     if(liveLastFinalized===0){const baseline=await apiJson('/api/status');liveLastFinalized=Number(baseline.lastFinalizedBlock||0);liveApplyStatus(baseline);}
     const sync=await apiJson(`/api/sync?max=${LIVE_SYNC_MAX_BLOCKS}`,{method:'POST'});const finalized=Number(sync.finalizedBlock||0),advanced=finalized>liveLastFinalized;if(finalized>0)liveLastFinalized=finalized;
-    const rolling=liveRollRange(),status=await apiJson('/api/status');liveApplyStatus(status);
+    const rolling=liveRollRange();
+
+    // The selected subnet is the real-time priority. Read its newly stored block
+    // immediately after the chain sync, before any expensive all-subnet summary.
+    if(rolling&&advanced){const {from,to}=selectedRange();await liveAppendDetail(from,to);}
+
+    // Only show the new sync timestamp after the detail table has caught up, so
+    // the header and the newest visible block do not appear minutes apart.
+    const status=await apiJson('/api/status');liveApplyStatus(status);
+
     if(Date.now()-liveLastRegistryRefresh>5*60_000||Number(status.activeSubnets)!==subnetRegistry.filter(x=>x.status==='active').length){await loadSubnets();liveLastRegistryRefresh=Date.now();}
-    if(rolling&&advanced){await loadOverview();const {from,to}=selectedRange();await liveAppendDetail(from,to);}
+
+    // The 128-subnet 24h aggregate is much heavier and does not need 12-second
+    // recomputation. Refresh it independently at most once per minute.
+    if(rolling&&advanced)liveRefreshOverviewInBackground();
   }catch(error){console.warn('live refresh failed',error);document.getElementById('syncStateLabel').textContent='实时同步重试中';}
   finally{liveBusy=false;}
 }
@@ -45,10 +76,6 @@ function datetimeSeconds(value){
   const input=document.getElementById(id);
   if(!input)return;
   let lastSeconds=datetimeSeconds(input.value);
-
-  // Remember the current seconds when the native picker opens. Chromium emits
-  // `input` while date/hour/minute/second columns are changed, so only a change
-  // in the seconds segment should finish the interaction and close the picker.
   const rememberSeconds=()=>{lastSeconds=datetimeSeconds(input.value);};
   input.addEventListener('focus',rememberSeconds);
   input.addEventListener('pointerdown',rememberSeconds);
@@ -56,16 +83,10 @@ function datetimeSeconds(value){
   input.addEventListener('input',()=>{
     if(!liveAdjustingRange)document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range==='custom'));
     const seconds=datetimeSeconds(input.value);
-    if(seconds!=null&&lastSeconds!=null&&seconds!==lastSeconds){
-      lastSeconds=seconds;
-      requestAnimationFrame(()=>input.blur());
-      return;
-    }
+    if(seconds!=null&&lastSeconds!=null&&seconds!==lastSeconds){lastSeconds=seconds;requestAnimationFrame(()=>input.blur());return;}
     lastSeconds=seconds;
   });
 
-  // Fallback for keyboard/manual edits and browsers that only dispatch change
-  // after the full value has been committed.
   input.addEventListener('change',()=>{
     if(!liveAdjustingRange)document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range==='custom'));
   });
