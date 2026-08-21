@@ -4,13 +4,6 @@ export const HOUR_MS = 3_600_000;
 export const DAY_MS = 86_400_000;
 const SHARD_WINDOW_MS = 8 * DAY_MS;
 
-export interface StoredBlockRow {
-  block_number: number;
-  block_hash: string;
-  timestamp_ms: number;
-  payload: string;
-}
-
 export function blockDatabases(env: Env): D1Database[] {
   return [env.BLOCKS_0, env.BLOCKS_1, env.BLOCKS_2, env.BLOCKS_3];
 }
@@ -26,7 +19,6 @@ export async function getState(db: D1Database, key: string): Promise<string | nu
   return row?.value ?? null;
 }
 
-/** No-op state writes are skipped so 12-second live polling stays inside D1 Free write limits. */
 export async function setState(db: D1Database, key: string, value: string): Promise<void> {
   await db.prepare(`
     INSERT INTO sync_state(key,value,updated_at_ms) VALUES(?,?,?)
@@ -35,12 +27,22 @@ export async function setState(db: D1Database, key: string, value: string): Prom
   `).bind(key, value, Date.now()).run();
 }
 
+export async function writeSyncStates(db: D1Database, values: Record<string,string>): Promise<void> {
+  const entries = Object.entries(values);
+  if (!entries.length) return;
+  const now = Date.now();
+  await db.batch(entries.map(([key,value]) => db.prepare(`
+    INSERT INTO sync_state(key,value,updated_at_ms) VALUES(?,?,?)
+    ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at_ms=excluded.updated_at_ms
+    WHERE sync_state.value <> excluded.value
+  `).bind(key,value,now)));
+}
+
 export async function listKnownNetuids(db: D1Database): Promise<number[]> {
   const result = await db.prepare('SELECT netuid FROM subnets ORDER BY netuid').all<{ netuid: number }>();
   return result.results.map(r => Number(r.netuid));
 }
 
-/** Only real registry changes produce D1 writes; unchanged 128-subnet snapshots are ignored. */
 export async function upsertSubnets(db: D1Database, rows: SubnetRecord[]): Promise<void> {
   if (!rows.length) return;
   const statements = rows.map(row => db.prepare(`
@@ -55,89 +57,37 @@ export async function upsertSubnets(db: D1Database, rows: SubnetRecord[]): Promi
     WHERE subnets.registration_counter IS NOT excluded.registration_counter
        OR subnets.name <> excluded.name
        OR subnets.status <> excluded.status
-  `).bind(row.netuid, row.registration_counter, row.name, row.status, row.first_seen_block, row.last_seen_block, row.updated_at_ms));
-  for (let i = 0; i < statements.length; i += 64) await db.batch(statements.slice(i, i + 64));
+  `).bind(row.netuid,row.registration_counter,row.name,row.status,row.first_seen_block,row.last_seen_block,row.updated_at_ms));
+  for (let i=0;i<statements.length;i+=64) await db.batch(statements.slice(i,i+64));
 }
 
 export async function storeBlock(env: Env, blockNumber: number, blockHash: string, timestampMs: number, payload: BlockPayload): Promise<boolean> {
-  const db = blockDbForTimestamp(env, timestampMs);
+  const db = blockDbForTimestamp(env,timestampMs);
   const result = await db.prepare(`
     INSERT OR IGNORE INTO blocks(block_number,block_hash,timestamp_ms,payload,created_at_ms)
     VALUES(?,?,?,?,?)
-  `).bind(blockNumber, blockHash, timestampMs, JSON.stringify(payload), Date.now()).run();
-  const changes = Number((result.meta as {changes?: number} | undefined)?.changes ?? 0);
-  return changes > 0;
+  `).bind(blockNumber,blockHash,timestampMs,JSON.stringify(payload),Date.now()).run();
+  return Number((result.meta as {changes?:number}|undefined)?.changes ?? 0) > 0;
 }
 
-export async function updateBlockPayload(env: Env, blockNumber: number, timestampMs: number, payload: BlockPayload): Promise<void> {
-  const db = blockDbForTimestamp(env, timestampMs);
-  await db.prepare('UPDATE blocks SET payload = ? WHERE block_number = ?')
-    .bind(JSON.stringify(payload), blockNumber).run();
-}
-
-export async function getEarliestStoredBlockNumber(env: Env): Promise<number | null> {
-  let earliest: number | null = null;
-  for (const db of blockDatabases(env)) {
-    const row = await db.prepare('SELECT MIN(block_number) AS n FROM blocks').first<{ n: number | null }>();
-    if (row?.n == null) continue;
-    const value = Number(row.n);
-    if (Number.isSafeInteger(value) && (earliest == null || value < earliest)) earliest = value;
-  }
-  return earliest;
-}
-
-export async function getStoredBlocksAfter(env: Env, afterBlock: number, limit: number): Promise<StoredBlockRow[]> {
-  const safeLimit = Math.max(1, Math.min(64, Math.trunc(limit)));
-  const merged: StoredBlockRow[] = [];
-  for (const db of blockDatabases(env)) {
-    const result = await db.prepare(`
-      SELECT block_number, block_hash, timestamp_ms, payload
-      FROM blocks
-      WHERE block_number > ?
-      ORDER BY block_number ASC
-      LIMIT ?
-    `).bind(afterBlock, safeLimit).all<StoredBlockRow>();
-    merged.push(...result.results.map(row => ({
-      block_number: Number(row.block_number),
-      block_hash: String(row.block_hash),
-      timestamp_ms: Number(row.timestamp_ms),
-      payload: String(row.payload)
-    })));
-  }
-  merged.sort((a, b) => a.block_number - b.block_number);
-  const unique: StoredBlockRow[] = [];
-  let previous = -1;
-  for (const row of merged) {
-    if (row.block_number === previous) continue;
-    unique.push(row);
-    previous = row.block_number;
-    if (unique.length >= safeLimit) break;
-  }
-  return unique;
-}
-
-function emptySummary(value: [string,string,string|null]): SubnetSummaryValue {
-  return ['0','0',value[2] == null ? null : '0',0];
-}
+function emptySummary(): SubnetSummaryValue { return ['0','0',0]; }
 
 export function addBlockToSummary(summary: SummaryPayload, block: BlockPayload): void {
-  for (const [netuid, value] of Object.entries(block)) {
-    const old = summary[netuid] ?? emptySummary(value);
+  for (const [netuid,value] of Object.entries(block)) {
+    const old = summary[netuid] ?? emptySummary();
     old[0] = (BigInt(old[0]) + BigInt(value[0])).toString();
     old[1] = (BigInt(old[1]) + BigInt(value[1])).toString();
-    old[2] = old[2] == null || value[2] == null ? null : (BigInt(old[2]) + BigInt(value[2])).toString();
-    old[3] += 1;
+    old[2] += 1;
     summary[netuid] = old;
   }
 }
 
 export function mergeSummaries(target: SummaryPayload, source: SummaryPayload): void {
-  for (const [netuid, value] of Object.entries(source)) {
-    const old = target[netuid] ?? ['0','0',value[2] == null ? null : '0',0];
+  for (const [netuid,value] of Object.entries(source)) {
+    const old = target[netuid] ?? emptySummary();
     old[0] = (BigInt(old[0]) + BigInt(value[0])).toString();
     old[1] = (BigInt(old[1]) + BigInt(value[1])).toString();
-    old[2] = old[2] == null || value[2] == null ? null : (BigInt(old[2]) + BigInt(value[2])).toString();
-    old[3] += value[3];
+    old[2] += value[2];
     target[netuid] = old;
   }
 }
@@ -148,34 +98,31 @@ export async function rebuildHourlySummary(env: Env, periodStartMs: number): Pro
   let blocks = 0;
   for (const db of blockDatabases(env)) {
     const result = await db.prepare('SELECT payload FROM blocks WHERE timestamp_ms >= ? AND timestamp_ms < ? ORDER BY timestamp_ms')
-      .bind(periodStartMs, periodEndMs).all<{payload:string}>();
+      .bind(periodStartMs,periodEndMs).all<{payload:string}>();
     blocks += result.results.length;
-    for (const row of result.results) addBlockToSummary(summary, JSON.parse(row.payload) as BlockPayload);
+    for (const row of result.results) addBlockToSummary(summary,JSON.parse(row.payload) as BlockPayload);
   }
   await env.META_DB.prepare(`
     INSERT INTO hourly_summary(period_start_ms,payload,block_count,updated_at_ms) VALUES(?,?,?,?)
-    ON CONFLICT(period_start_ms) DO UPDATE SET payload=excluded.payload, block_count=excluded.block_count, updated_at_ms=excluded.updated_at_ms
-  `).bind(periodStartMs, JSON.stringify(summary), blocks, Date.now()).run();
+    ON CONFLICT(period_start_ms) DO UPDATE SET payload=excluded.payload,block_count=excluded.block_count,updated_at_ms=excluded.updated_at_ms
+  `).bind(periodStartMs,JSON.stringify(summary),blocks,Date.now()).run();
 }
 
 export async function ensureClosedHourlySummaries(env: Env, latestTimestampMs: number): Promise<void> {
-  const currentHour = Math.floor(latestTimestampMs / HOUR_MS) * HOUR_MS;
-  const state = await getState(env.META_DB, 'next_hourly_summary_ms');
-  if (state == null) {
-    await setState(env.META_DB, 'next_hourly_summary_ms', String(currentHour));
-    return;
-  }
+  const currentHour = Math.floor(latestTimestampMs/HOUR_MS)*HOUR_MS;
+  const state = await getState(env.META_DB,'next_hourly_summary_ms');
+  if (state == null) { await setState(env.META_DB,'next_hourly_summary_ms',String(currentHour)); return; }
   let next = Number(state);
   while (Number.isFinite(next) && next < currentHour) {
-    await rebuildHourlySummary(env, next);
+    await rebuildHourlySummary(env,next);
     next += HOUR_MS;
-    await setState(env.META_DB, 'next_hourly_summary_ms', String(next));
+    await setState(env.META_DB,'next_hourly_summary_ms',String(next));
   }
 }
 
 export async function cleanupOldData(env: Env, retentionDays: number): Promise<void> {
-  const cutoff = Date.now() - retentionDays * DAY_MS;
+  const cutoff = Date.now() - retentionDays*DAY_MS;
   for (const db of blockDatabases(env)) await db.prepare('DELETE FROM blocks WHERE timestamp_ms < ?').bind(cutoff).run();
   await env.META_DB.prepare('DELETE FROM hourly_summary WHERE period_start_ms < ?').bind(Math.floor(cutoff/HOUR_MS)*HOUR_MS).run();
-  await setState(env.META_DB, 'last_cleanup_ms', String(Date.now()));
+  await setState(env.META_DB,'last_cleanup_ms',String(Date.now()));
 }
