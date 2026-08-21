@@ -14,6 +14,14 @@
   "triggers": {
     "crons": ["* * * * *", "17 0 * * *"]
   },
+  "durable_objects": {
+    "bindings": [
+      {"name":"CHAIN_COLLECTOR","class_name":"ChainCollector"}
+    ]
+  },
+  "migrations": [
+    {"tag":"collector-v1","new_sqlite_classes":["ChainCollector"]}
+  ],
   "vars": {
     "SUBTENSOR_WS_URL": "wss://entrypoint-finney.opentensor.ai:443",
     "RETENTION_DAYS": "30"
