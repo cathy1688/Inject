@@ -51,7 +51,7 @@ async function loadStatus(){
 }
 
 async function loadSubnets(){const data=await apiJson('/api/subnets');subnetRegistry=(data.items||[]).map(x=>({...x,netuid:Number(x.netuid)}));const active=subnetRegistry.filter(x=>x.status==='active');if(!active.some(x=>x.netuid===selectedSubnet))selectedSubnet=active.find(x=>x.netuid===128)?.netuid??active[0]?.netuid??0;fillSubnetSelect();}
-function fillSubnetSelect(){const select=document.getElementById('subnetSelect');select.innerHTML='';subnetRegistry.filter(x=>x.status==='active').forEach(x=>{const o=document.createElement('option');o.value=x.netuid;o.textContent=`SN${x.netuid} · ${x.name}`;o.selected=x.netuid===selectedSubnet;select.appendChild(o);});}
+function fillSubnetSelect(){const select=document.getElementById('subnetSelect');const pending=Number(select.value)||selectedSubnet;select.innerHTML='';const active=subnetRegistry.filter(x=>x.status==='active');const target=active.some(x=>x.netuid===pending)?pending:selectedSubnet;active.forEach(x=>{const o=document.createElement('option');o.value=x.netuid;o.textContent=`SN${x.netuid} · ${x.name}`;o.selected=x.netuid===target;select.appendChild(o);});}
 
 async function loadOverview(){const {from,to}=selectedRange();const data=await apiJson('/api/subnets/summary?'+queryString({from,to}));overviewItems=data.items||[];renderOverview();updateSelectedMetrics();}
 
@@ -116,12 +116,11 @@ function drawChart(items){
 }
 
 function setRange(type){document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range===type));if(type==='custom')return;const end=new Date(),days=type==='24h'?1:type==='7d'?7:30,start=new Date(end.getTime()-days*DAY_MS);document.getElementById('startTime').value=toLocalInput(start);document.getElementById('endTime').value=toLocalInput(end);}
-async function runQuery(){await syncChain();await Promise.all([loadStatus(),loadSubnets()]);await loadOverview();await loadDetail();}
+async function runQuery(){const requestedSubnet=Number(document.getElementById('subnetSelect').value);if(Number.isInteger(requestedSubnet)&&requestedSubnet>0)selectedSubnet=requestedSubnet;await syncChain();await Promise.all([loadStatus(),loadSubnets()]);await loadOverview();await loadDetail();}
 
 list.addEventListener('scroll',renderVirtual,{passive:true});
 document.getElementById('subnetSearch').addEventListener('input',renderOverview);
 document.getElementById('blockSearch').addEventListener('input',applyBlockSearch);
-document.getElementById('subnetSelect').addEventListener('change',async e=>{selectedSubnet=Number(e.target.value);updateSelectedMetrics();await loadDetail();});
 document.querySelectorAll('.preset').forEach(b=>b.onclick=()=>setRange(b.dataset.range));
 document.getElementById('applyBtn').onclick=runQuery;
 document.getElementById('syncBtn').onclick=runQuery;
