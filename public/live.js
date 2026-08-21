@@ -22,17 +22,20 @@ async function liveAppendDetail(from,to){
   liveRecomputeRows(from,to);liveRefreshFilteredRows();document.getElementById('rangeText').textContent=`${fmtDate(from)} — ${fmtDate(to)}`;await loadChart();
 }
 
-async function liveTick(force=false){
+async function liveTick(){
   if(liveBusy||document.visibilityState==='hidden')return;liveBusy=true;
   try{
+    // Establish a baseline from the already-saved D1 state so the first live tick
+    // does not mistake the entire existing dataset for a new update and reload it.
+    if(liveLastFinalized===0){const baseline=await apiJson('/api/status');liveLastFinalized=Number(baseline.lastFinalizedBlock||0);liveApplyStatus(baseline);}
     const sync=await apiJson(`/api/sync?max=${LIVE_SYNC_MAX_BLOCKS}`,{method:'POST'});const finalized=Number(sync.finalizedBlock||0),advanced=finalized>liveLastFinalized;if(finalized>0)liveLastFinalized=finalized;
     const rolling=liveRollRange(),status=await apiJson('/api/status');liveApplyStatus(status);
     if(Date.now()-liveLastRegistryRefresh>5*60_000||Number(status.activeSubnets)!==subnetRegistry.filter(x=>x.status==='active').length){await loadSubnets();liveLastRegistryRefresh=Date.now();}
-    if(rolling&&(advanced||force)){await loadOverview();const {from,to}=selectedRange();if(advanced)await liveAppendDetail(from,to);else if(force)await loadDetail();}
+    if(rolling&&advanced){await loadOverview();const {from,to}=selectedRange();await liveAppendDetail(from,to);}
   }catch(error){console.warn('live refresh failed',error);document.getElementById('syncStateLabel').textContent='实时同步重试中';}
   finally{liveBusy=false;}
 }
 
 ['startTime','endTime'].forEach(id=>document.getElementById(id)?.addEventListener('change',()=>{if(liveAdjustingRange)return;document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range==='custom'));}));
-window.addEventListener('load',()=>{setTimeout(()=>liveTick(true),LIVE_REFRESH_MS);setInterval(()=>liveTick(false),LIVE_REFRESH_MS);});
-document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')liveTick(true);});
+window.addEventListener('load',()=>{setTimeout(()=>liveTick(),LIVE_REFRESH_MS);setInterval(()=>liveTick(),LIVE_REFRESH_MS);});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')liveTick();});
