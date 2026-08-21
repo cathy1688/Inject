@@ -9,12 +9,12 @@ export interface Env {
   RETENTION_DAYS?: string;
 }
 
-/** Compact block value: [actual injected RAO, Chain Buys RAO, theoretical injected RAO]. */
-export type SubnetBlockValue = [string, string, string | null];
+/** Compact block value: [actual injected RAO, Chain Buys RAO]. */
+export type SubnetBlockValue = [string, string];
 export type BlockPayload = Record<string, SubnetBlockValue>;
 
-/** Compact summary value: [actual RAO, Chain Buys RAO, theoretical RAO, block count]. */
-export type SubnetSummaryValue = [string, string, string | null, number];
+/** Compact summary value: [actual injected RAO, Chain Buys RAO, block count]. */
+export type SubnetSummaryValue = [string, string, number];
 export type SummaryPayload = Record<string, SubnetSummaryValue>;
 
 export interface SubnetRecord {
