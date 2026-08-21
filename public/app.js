@@ -3,6 +3,7 @@ const DAY_MS=86_400_000;
 const ROW_H=48;
 const OVERSCAN=8;
 const PAGE_SIZE=5000;
+const SUBNET_CACHE_KEY='inject_subnets_v1';
 
 let subnetRegistry=[];
 let overviewItems=[];
@@ -29,7 +30,7 @@ async function apiJson(path,options){const response=await fetch(path,options);co
 
 function setDefaultRange(){const end=new Date(),start=new Date(end.getTime()-DAY_MS);document.getElementById('startTime').value=toLocalInput(start);document.getElementById('endTime').value=toLocalInput(end);}
 
-async function syncChain(){document.getElementById('syncStateLabel').textContent='同步中';try{await apiJson('/api/sync?max=8',{method:'POST'});}catch(error){console.warn('sync failed',error);}}
+async function syncChain(showState=true){if(showState)document.getElementById('syncStateLabel').textContent='同步中';try{return await apiJson('/api/sync?max=8',{method:'POST'});}catch(error){console.warn('sync failed',error);throw error;}}
 
 async function loadStatus(){
   try{
@@ -43,14 +44,34 @@ async function loadStatus(){
     document.getElementById('rpcStatusText').textContent=ok?'链上连接正常':s.rpcStatus==='error'?'链上连接异常':'等待首次同步';
     document.getElementById('syncStateLabel').textContent=ok?'实时同步':s.rpcStatus==='error'?'异常':'等待同步';
     document.getElementById('rpcDot').style.background=ok?'var(--good)':'var(--bad)';
-  }catch{
+    return s;
+  }catch(error){
     document.getElementById('rpcStatusText').textContent='服务连接异常';
     document.getElementById('syncStateLabel').textContent='异常';
     document.getElementById('rpcDot').style.background='var(--bad)';
+    throw error;
   }
 }
 
-async function loadSubnets(){const data=await apiJson('/api/subnets');subnetRegistry=(data.items||[]).map(x=>({...x,netuid:Number(x.netuid)}));const active=subnetRegistry.filter(x=>x.status==='active');if(!active.some(x=>x.netuid===selectedSubnet))selectedSubnet=active.find(x=>x.netuid===128)?.netuid??active[0]?.netuid??0;fillSubnetSelect();}
+function restoreSubnetCache(){
+  try{
+    const cached=JSON.parse(localStorage.getItem(SUBNET_CACHE_KEY)||'null');
+    if(!cached||!Array.isArray(cached.items)||Date.now()-Number(cached.savedAt||0)>6*60*60_000)return;
+    subnetRegistry=cached.items.map(x=>({...x,netuid:Number(x.netuid)}));
+    const active=subnetRegistry.filter(x=>x.status==='active');
+    if(!active.some(x=>x.netuid===selectedSubnet))selectedSubnet=active.find(x=>x.netuid===128)?.netuid??active[0]?.netuid??0;
+    fillSubnetSelect();
+  }catch{}
+}
+
+async function loadSubnets(){
+  const data=await apiJson('/api/subnets');
+  subnetRegistry=(data.items||[]).map(x=>({...x,netuid:Number(x.netuid)}));
+  const active=subnetRegistry.filter(x=>x.status==='active');
+  if(!active.some(x=>x.netuid===selectedSubnet))selectedSubnet=active.find(x=>x.netuid===128)?.netuid??active[0]?.netuid??0;
+  fillSubnetSelect();
+  try{localStorage.setItem(SUBNET_CACHE_KEY,JSON.stringify({savedAt:Date.now(),items:subnetRegistry}));}catch{}
+}
 function fillSubnetSelect(){const select=document.getElementById('subnetSelect');const pending=Number(select.value)||selectedSubnet;select.innerHTML='';const active=subnetRegistry.filter(x=>x.status==='active');const target=active.some(x=>x.netuid===pending)?pending:selectedSubnet;active.forEach(x=>{const o=document.createElement('option');o.value=x.netuid;o.textContent=`SN${x.netuid} · ${x.name}`;o.selected=x.netuid===target;select.appendChild(o);});}
 
 async function loadOverview(){const {from,to}=selectedRange();const data=await apiJson('/api/subnets/summary?'+queryString({from,to}));overviewItems=data.items||[];renderOverview();updateSelectedMetrics();}
@@ -58,13 +79,7 @@ async function loadOverview(){const {from,to}=selectedRange();const data=await a
 function renderOverview(){
   const q=document.getElementById('subnetSearch').value.trim().toLowerCase(),container=document.getElementById('overviewRows');
   const items=overviewItems.filter(x=>!q||(`sn${x.netuid} ${x.name}`).toLowerCase().includes(q));
-  container.innerHTML=items.map(x=>`<div class="overview-row" data-sn="${x.netuid}">
-    <div class="sn">SN${x.netuid} · ${x.name}</div>
-    <div>${fmtNum(tao(x.actualRao),5)} TAO</div>
-    <div class="muted">${fmtNum(tao(x.chainBuyRao),5)} TAO</div>
-    <div>${fmtNum(tao(x.totalEmissionRao),5)} TAO</div>
-    <div class="muted">${x.status==='active'?'活跃':'已注销'}</div>
-  </div>`).join('');
+  container.innerHTML=items.map(x=>`<div class="overview-row" data-sn="${x.netuid}"><div class="sn">SN${x.netuid} · ${x.name}</div><div>${fmtNum(tao(x.actualRao),5)} TAO</div><div class="muted">${fmtNum(tao(x.chainBuyRao),5)} TAO</div><div>${fmtNum(tao(x.totalEmissionRao),5)} TAO</div><div class="muted">${x.status==='active'?'活跃':'已注销'}</div></div>`).join('');
   container.querySelectorAll('.overview-row').forEach(el=>el.onclick=async()=>{selectedSubnet=Number(el.dataset.sn);document.getElementById('subnetSelect').value=String(selectedSubnet);updateSelectedMetrics();await loadDetail();document.querySelector('.metrics').scrollIntoView({behavior:'smooth',block:'start'});});
 }
 
@@ -97,36 +112,31 @@ function sortBlockRows(){const dir=blockSortDir==='asc'?1:-1;filteredRows.sort((
 function updateSortHeader(){document.querySelectorAll('#blockTableHead .sort-cell').forEach(cell=>{const active=cell.dataset.key===blockSortKey;cell.classList.toggle('active',active);cell.querySelector('.sort-mark').textContent=active?(blockSortDir==='asc'?'↑':'↓'):'';});}
 function applyBlockSearch(){const q=document.getElementById('blockSearch').value.trim().toLowerCase().replace(/,/g,'').replace('#','');filteredRows=!q?rows.slice():rows.filter(r=>String(r.block).includes(q)||String(r.i)===q||fmtDate(r.time).toLowerCase().includes(q));sortBlockRows();resetVirtual();}
 function resetVirtual(resetScroll=true){spacer.style.height=(filteredRows.length*ROW_H)+'px';if(resetScroll)list.scrollTop=0;renderVirtual();}
-function renderVirtual(){
-  const start=Math.max(0,Math.floor(list.scrollTop/ROW_H)-OVERSCAN),visible=Math.ceil(list.clientHeight/ROW_H)+OVERSCAN*2,end=Math.min(filteredRows.length,start+visible);win.style.transform=`translateY(${start*ROW_H}px)`;let html='';
-  for(let k=start;k<end;k++){const r=filteredRows[k];html+=`<div class="row"><div class="idx">${r.i.toLocaleString()}</div><div class="block">#${r.block.toLocaleString()}</div><div class="time">${fmtDate(r.time)}</div><div class="num actual">${fmtNum(r.actual,8)} TAO</div><div class="num">${fmtNum(r.chainBuy,8)} TAO</div><div class="num">${fmtNum(r.totalEmission,8)} TAO</div><div class="num cum">${fmtNum(r.cumA,6)} TAO</div></div>`;}
-  win.innerHTML=html;const first=filteredRows.length?Math.min(filteredRows.length,Math.floor(list.scrollTop/ROW_H)+1):0,last=filteredRows.length?Math.min(filteredRows.length,first+Math.ceil(list.clientHeight/ROW_H)-1):0;document.getElementById('visibleRange').textContent=`${first.toLocaleString()}–${last.toLocaleString()} / ${filteredRows.length.toLocaleString()}`;
-}
+function renderVirtual(){const start=Math.max(0,Math.floor(list.scrollTop/ROW_H)-OVERSCAN),visible=Math.ceil(list.clientHeight/ROW_H)+OVERSCAN*2,end=Math.min(filteredRows.length,start+visible);win.style.transform=`translateY(${start*ROW_H}px)`;let html='';for(let k=start;k<end;k++){const r=filteredRows[k];html+=`<div class="row"><div class="idx">${r.i.toLocaleString()}</div><div class="block">#${r.block.toLocaleString()}</div><div class="time">${fmtDate(r.time)}</div><div class="num actual">${fmtNum(r.actual,8)} TAO</div><div class="num">${fmtNum(r.chainBuy,8)} TAO</div><div class="num">${fmtNum(r.totalEmission,8)} TAO</div><div class="num cum">${fmtNum(r.cumA,6)} TAO</div></div>`;}win.innerHTML=html;const first=filteredRows.length?Math.min(filteredRows.length,Math.floor(list.scrollTop/ROW_H)+1):0,last=filteredRows.length?Math.min(filteredRows.length,first+Math.ceil(list.clientHeight/ROW_H)-1):0;document.getElementById('visibleRange').textContent=`${first.toLocaleString()}–${last.toLocaleString()} / ${filteredRows.length.toLocaleString()}`;}
 
-async function loadChart(){
-  const mode=document.getElementById('chartMode').value;
-  if(mode==='raw'&&rows.length){const maxPoints=1200,step=Math.max(1,Math.ceil(rows.length/maxPoints));drawChart(rows.filter((_,i)=>i%step===0).map(r=>({actual_rao:r.actual*RAO_PER_TAO})));document.getElementById('chartHint').textContent=`原始区块完整保存 · 图表抽样 ${Math.min(rows.length,maxPoints).toLocaleString()} 点`;return;}
-  const {from,to}=selectedRange();try{const data=await apiJson('/api/chart?'+queryString({netuid:selectedSubnet,from,to}));drawChart(data.items||[]);document.getElementById('chartHint').textContent='按小时准确汇总';}catch{drawChart([]);}
-}
-function drawChart(items){
-  const canvas=document.getElementById('chart'),rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);const w=rect.width,h=rect.height,pL=52,pR=16,pT=18,pB=30;ctx.clearRect(0,0,w,h);
-  if(!items.length){ctx.fillStyle='#40566d';ctx.font='13px Source Han Sans SC,Microsoft YaHei';ctx.fillText('所选时间范围暂无趋势数据',pL,pT+24);return;}
-  const A=items.map(x=>tao(x.actual_rao));let min=Math.min(...A),max=Math.max(...A);if(min===max){min-=Math.max(.000000001,min*.01);max+=Math.max(.000000001,max*.01);}const x=i=>pL+i*(w-pL-pR)/Math.max(A.length-1,1),y=v=>pT+(max-v)*(h-pT-pB)/(max-min||1);
-  ctx.strokeStyle='#eee9e1';ctx.fillStyle='#40566d';ctx.lineWidth=1;ctx.font='10px Source Han Sans SC,Microsoft YaHei';for(let g=0;g<4;g++){const yy=pT+g*(h-pT-pB)/3;ctx.beginPath();ctx.moveTo(pL,yy);ctx.lineTo(w-pR,yy);ctx.stroke();ctx.fillText((max-g*(max-min)/3).toFixed(6),4,yy+3);}ctx.beginPath();A.forEach((v,i)=>{const xx=x(i),yy=y(v);if(i)ctx.lineTo(xx,yy);else ctx.moveTo(xx,yy);});ctx.strokeStyle='#63283a';ctx.lineWidth=1.8;ctx.stroke();
-}
+async function loadChart(){const mode=document.getElementById('chartMode').value;if(mode==='raw'&&rows.length){const maxPoints=1200,step=Math.max(1,Math.ceil(rows.length/maxPoints));drawChart(rows.filter((_,i)=>i%step===0).map(r=>({actual_rao:r.actual*RAO_PER_TAO})));document.getElementById('chartHint').textContent=`原始区块完整保存 · 图表抽样 ${Math.min(rows.length,maxPoints).toLocaleString()} 点`;return;}const {from,to}=selectedRange();try{const data=await apiJson('/api/chart?'+queryString({netuid:selectedSubnet,from,to}));drawChart(data.items||[]);document.getElementById('chartHint').textContent='按小时准确汇总';}catch{drawChart([]);}}
+function drawChart(items){const canvas=document.getElementById('chart'),rect=canvas.getBoundingClientRect(),dpr=window.devicePixelRatio||1;canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;const ctx=canvas.getContext('2d');ctx.scale(dpr,dpr);const w=rect.width,h=rect.height,pL=52,pR=16,pT=18,pB=30;ctx.clearRect(0,0,w,h);if(!items.length){ctx.fillStyle='#40566d';ctx.font='13px Source Han Sans SC,Microsoft YaHei';ctx.fillText('所选时间范围暂无趋势数据',pL,pT+24);return;}const A=items.map(x=>tao(x.actual_rao));let min=Math.min(...A),max=Math.max(...A);if(min===max){min-=Math.max(.000000001,min*.01);max+=Math.max(.000000001,max*.01);}const x=i=>pL+i*(w-pL-pR)/Math.max(A.length-1,1),y=v=>pT+(max-v)*(h-pT-pB)/(max-min||1);ctx.strokeStyle='#eee9e1';ctx.fillStyle='#40566d';ctx.lineWidth=1;ctx.font='10px Source Han Sans SC,Microsoft YaHei';for(let g=0;g<4;g++){const yy=pT+g*(h-pT-pB)/3;ctx.beginPath();ctx.moveTo(pL,yy);ctx.lineTo(w-pR,yy);ctx.stroke();ctx.fillText((max-g*(max-min)/3).toFixed(6),4,yy+3);}ctx.beginPath();A.forEach((v,i)=>{const xx=x(i),yy=y(v);if(i)ctx.lineTo(xx,yy);else ctx.moveTo(xx,yy);});ctx.strokeStyle='#63283a';ctx.lineWidth=1.8;ctx.stroke();}
 
 function setRange(type){document.querySelectorAll('.preset').forEach(b=>b.classList.toggle('active',b.dataset.range===type));if(type==='custom')return;const end=new Date(),days=type==='24h'?1:type==='7d'?7:30,start=new Date(end.getTime()-days*DAY_MS);document.getElementById('startTime').value=toLocalInput(start);document.getElementById('endTime').value=toLocalInput(end);}
-async function runQuery(){const requestedSubnet=Number(document.getElementById('subnetSelect').value);if(Number.isInteger(requestedSubnet)&&requestedSubnet>0)selectedSubnet=requestedSubnet;await syncChain();await Promise.all([loadStatus(),loadSubnets()]);await loadOverview();await loadDetail();}
+
+async function runQuery(){const requestedSubnet=Number(document.getElementById('subnetSelect').value);if(Number.isInteger(requestedSubnet)&&requestedSubnet>0)selectedSubnet=requestedSubnet;document.getElementById('applyBtn').disabled=true;try{await Promise.all([loadOverview(),loadDetail(),loadStatus()]);}finally{document.getElementById('applyBtn').disabled=false;}}
+
+async function syncNow(){document.getElementById('syncBtn').disabled=true;try{await syncChain(true);await Promise.all([loadStatus(),loadSubnets()]);await Promise.all([loadOverview(),loadDetail()]);}finally{document.getElementById('syncBtn').disabled=false;}}
 
 list.addEventListener('scroll',renderVirtual,{passive:true});
 document.getElementById('subnetSearch').addEventListener('input',renderOverview);
 document.getElementById('blockSearch').addEventListener('input',applyBlockSearch);
 document.querySelectorAll('.preset').forEach(b=>b.onclick=()=>setRange(b.dataset.range));
 document.getElementById('applyBtn').onclick=runQuery;
-document.getElementById('syncBtn').onclick=runQuery;
+document.getElementById('syncBtn').onclick=syncNow;
 document.getElementById('chartMode').addEventListener('change',()=>loadChart().catch(()=>{}));
 document.querySelectorAll('#blockTableHead .sort-cell').forEach(cell=>cell.addEventListener('click',()=>{const key=cell.dataset.key;if(blockSortKey===key)blockSortDir=blockSortDir==='asc'?'desc':'asc';else{blockSortKey=key;blockSortDir='asc';}filteredRows=filteredRows.slice();sortBlockRows();resetVirtual();}));
 document.getElementById('exportBtn').onclick=()=>{const {from,to}=selectedRange();location.href='/api/export.csv?'+queryString({netuid:selectedSubnet,from,to});};
 window.addEventListener('resize',()=>loadChart().catch(()=>{}));
 
-(async function init(){setDefaultRange();updateSortHeader();await syncChain();await loadStatus();await loadSubnets();await loadOverview();await loadDetail();})().catch(error=>{console.error(error);document.getElementById('rpcStatusText').textContent='初始化失败';document.getElementById('rpcDot').style.background='var(--bad)';});
+(async function init(){
+  setDefaultRange();updateSortHeader();restoreSubnetCache();
+  const bootstrap=await Promise.allSettled([loadStatus(),loadSubnets()]);
+  if(!subnetRegistry.length&&bootstrap.every(x=>x.status==='rejected'))throw new Error('bootstrap failed');
+  await Promise.allSettled([loadOverview(),loadDetail()]);
+})().catch(error=>{console.error(error);document.getElementById('rpcStatusText').textContent='初始化失败';document.getElementById('rpcDot').style.background='var(--bad)';});
